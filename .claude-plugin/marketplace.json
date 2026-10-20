@@ -1,0 +1,22 @@
+{
+  "name": "tachyons",
+  "owner": { "name": "southstar21", "url": "https://southstar21.dev" },
+  "metadata": { "description": "Claude Code plugins: a session sidebar, a browser visual companion and a prompt cache keep-alive" },
+  "plugins": [
+    {
+      "name": "tachyons-sidebar",
+      "source": "./plugins/tachyons-sidebar",
+      "description": "A small right sidebar with context used, usage limits, cost, files changed and subagents spawned"
+    },
+    {
+      "name": "tachyons-visualize",
+      "source": "./plugins/tachyons-visualize",
+      "description": "User-invoked browser companion for mockups, diagrams and side-by-side visual choices"
+    },
+    {
+      "name": "tachyons-cache",
+      "source": "./plugins/tachyons-cache",
+      "description": "Keeps the prompt cache warm while the session sits idle by re-reading the transcript prefix before the cache entry lapses"
+    }
+  ]
+}

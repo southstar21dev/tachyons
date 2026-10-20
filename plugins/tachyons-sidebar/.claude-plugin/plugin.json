@@ -1,0 +1,13 @@
+{
+  "name": "tachyons-sidebar",
+  "version": "0.1.3",
+  "description": "A small right sidebar with context used, usage limits, cost, files changed and subagents spawned",
+  "author": {
+    "name": "southstar21",
+    "url": "https://southstar21.dev"
+  },
+  "homepage": "https://github.com/southstar21dev/tachyons/tree/main/plugins/tachyons-sidebar",
+  "repository": "https://github.com/southstar21dev/tachyons",
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}

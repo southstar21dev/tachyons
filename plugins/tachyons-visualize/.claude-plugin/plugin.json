@@ -1,0 +1,13 @@
+{
+  "name": "tachyons-visualize",
+  "version": "0.2.1",
+  "description": "User-invoked browser companion for mockups, diagrams and side-by-side visual choices",
+  "author": {
+    "name": "southstar21",
+    "url": "https://southstar21.dev"
+  },
+  "homepage": "https://github.com/southstar21dev/tachyons/tree/main/plugins/tachyons-visualize",
+  "repository": "https://github.com/southstar21dev/tachyons",
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}

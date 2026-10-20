@@ -1,0 +1,27 @@
+{
+  "name": "tachyons-cache",
+  "version": "0.1.1",
+  "description": "Keeps the prompt cache warm while the session sits idle by re-reading the transcript prefix before the cache entry lapses",
+  "author": {
+    "name": "southstar21",
+    "url": "https://southstar21.dev"
+  },
+  "homepage": "https://github.com/southstar21dev/tachyons/tree/main/plugins/tachyons-cache",
+  "repository": "https://github.com/southstar21dev/tachyons",
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "intervalSeconds": {
+      "type": "number",
+      "title": "Ping interval (seconds)",
+      "description": "Idle time between warm-up pings. Keep it under the cache TTL: 270 for the 5 minute cache, about 3300 for the 1 hour cache.",
+      "default": 270
+    },
+    "maxPings": {
+      "type": "number",
+      "title": "Max pings per idle stretch",
+      "description": "Stop warming after this many pings without a new turn.",
+      "default": 12
+    }
+  }
+}

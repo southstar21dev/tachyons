@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}} · visualize</title>
+<link rel="stylesheet" href="/tachyons.css">
+<style>
+  :root {
+    --bg: #faf6ee; --surface: #ffffff; --surface-2: #f3ecdd; --border: #e6d8b8;
+    --text: #1d1b17; --text-2: #5f584b; --text-3: #8d8473;
+    --accent: #d97757; --accent-soft: rgba(217,119,87,.12);
+    --good: #4f8a3f; --bad: #b8483a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12110f; --surface: #1b1a17; --surface-2: #24221e; --border: #3a352c;
+      --text: #f5ecd7; --text-2: #c9bea5; --text-3: #8a8270;
+      --accent: #e08a6c; --accent-soft: rgba(224,138,108,.16);
+      --good: #8fbf7f; --bad: #e07a6c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+
+  .tv-bar { position: sticky; top: 0; z-index: 10; display: flex; align-items: center; gap: 12px;
+    padding: 10px 20px; background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(8px); border-bottom: 1px solid var(--border); font-size: 13px; color: var(--text-2); }
+  .tv-mark { font-weight: 600; color: var(--text); letter-spacing: .02em; }
+  .tv-mark span { color: var(--accent); }
+  .tv-screen { color: var(--text-3); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .tv-status { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; --dot: var(--text-3); }
+  .tv-status::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--dot); }
+  .tv-main { max-width: 1100px; margin: 0 auto; padding: 32px 20px 64px; }
+
+  h2 { font-size: 24px; font-weight: 600; margin: 0 0 4px; letter-spacing: -.01em; }
+  h3 { font-size: 16px; font-weight: 600; margin: 0 0 4px; }
+  .subtitle { color: var(--text-2); margin: 0 0 24px; }
+  .section { margin-bottom: 32px; }
+  .label { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-3); }
+
+  /* Choices: any [data-choice] inside a [data-group] is selectable. */
+  [data-choice] { cursor: pointer; transition: border-color .15s, box-shadow .15s, transform .15s; }
+  [data-choice]:hover { border-color: var(--text-3); }
+  [data-choice].selected { border-color: var(--accent) !important; box-shadow: 0 0 0 3px var(--accent-soft); }
+
+  .options { display: grid; gap: 12px; }
+  .option { display: flex; gap: 14px; align-items: flex-start; padding: 16px; background: var(--surface);
+    border: 1px solid var(--border); border-radius: 10px; }
+  .option .letter { flex: none; width: 28px; height: 28px; border-radius: 7px; display: grid; place-items: center;
+    background: var(--surface-2); color: var(--text-2); font-weight: 600; font-size: 13px; }
+  .option.selected .letter { background: var(--accent); color: #fff; }
+  .option p, .card p { margin: 0; color: var(--text-2); font-size: 14px; }
+
+  .cards { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+  .card-image { min-height: 160px; background: var(--surface-2); border-bottom: 1px solid var(--border); }
+  .card-body { padding: 14px 16px; }
+
+  .mockup { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+  .mockup-header { padding: 8px 14px; font-size: 12px; color: var(--text-3); background: var(--surface-2);
+    border-bottom: 1px solid var(--border); }
+  .mockup-body { padding: 16px; }
+  .split { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+
+  .pros-cons { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+  .pros, .cons { padding: 16px; border-radius: 10px; background: var(--surface); border: 1px solid var(--border); }
+  .pros h4 { color: var(--good); margin: 0 0 8px; } .cons h4 { color: var(--bad); margin: 0 0 8px; }
+  .pros ul, .cons ul { margin: 0; padding-left: 18px; color: var(--text-2); }
+
+  /* Wireframe pieces */
+  .mock-nav { padding: 10px 14px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; color: var(--text-2); font-size: 13px; }
+  .mock-sidebar { flex: none; width: 180px; padding: 12px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; color: var(--text-2); font-size: 13px; }
+  .mock-content { flex: 1; padding: 12px; color: var(--text-2); }
+  .mock-button { padding: 8px 14px; border: 0; border-radius: 6px; background: var(--accent); color: #fff; font: inherit; }
+  .mock-input { padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text); font: inherit; }
+  .placeholder { display: grid; place-items: center; min-height: 100px; border: 1px dashed var(--border);
+    border-radius: 8px; color: var(--text-3); font-size: 13px; }
+
+  /* Diagram helpers */
+  .node { display: inline-block; padding: 8px 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+  .arrow { color: var(--text-3); padding: 0 8px; }
+</style>
+</head>
+<body>
+  <div class="tv-bar">
+    <span class="tv-mark">tachyons<span>·</span>visualize</span>
+    <span class="tv-screen">{{TITLE}}</span>
+    <span class="tv-status">Connecting…</span>
+  </div>
+  <main class="tv-main">
+{{CONTENT}}
+  </main>
+{{HELPER}}
+</body>
+</html>

@@ -1,0 +1,9 @@
+# Written by Claude Code when it loads a plugin (API types for the editor)
+.claude-plugin/types/
+plugins/*/.claude-plugin/types/
+
+# Visualize sessions created while developing
+.tachyons/
+
+node_modules/
+.DS_Store
