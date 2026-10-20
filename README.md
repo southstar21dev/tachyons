@@ -1,8 +1,6 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/tachyons-horizontal-cream.svg">
-    <img alt="tachyons" src="assets/logo/tachyons-horizontal-darkroast.svg" width="420">
-  </picture>
+  <img alt="tachyons" src="assets/logo/tachyons-horizontal-darkroast.svg#gh-light-mode-only" width="420">
+  <img alt="tachyons" src="assets/logo/tachyons-horizontal-cream.svg#gh-dark-mode-only" width="420">
 </p>
 
 <p align="center">Plugins for <a href="https://claude.com/claude-code">Claude Code</a>, one marketplace.</p>
