@@ -1,6 +1,11 @@
-# tachyons
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/tachyons-horizontal-cream.svg">
+    <img alt="tachyons" src="assets/logo/tachyons-horizontal-darkroast.svg" width="420">
+  </picture>
+</p>
 
-Plugins for [Claude Code](https://claude.com/claude-code), one marketplace.
+<p align="center">Plugins for <a href="https://claude.com/claude-code">Claude Code</a>, one marketplace.</p>
 
 | Plugin | What it does |
 |---|---|
@@ -25,6 +30,7 @@ To work on a local clone instead, use `/plugin marketplace add /path/to/tachyons
 
 ```
 .claude-plugin/marketplace.json   the marketplace: lists every plugin below
+assets/logo/                      logo files, social preview and the script that builds them
 plugins/
   <plugin>/
     .claude-plugin/plugin.json    manifest
