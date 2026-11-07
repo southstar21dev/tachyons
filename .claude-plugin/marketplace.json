@@ -1,12 +1,22 @@
 {
   "name": "tachyons",
-  "owner": { "name": "southstar21", "url": "https://southstar21.dev" },
-  "metadata": { "description": "Claude Code plugins: a session sidebar, a browser visual companion and a prompt cache keep-alive" },
+  "owner": {
+    "name": "southstar21",
+    "url": "https://southstar21.dev"
+  },
+  "metadata": {
+    "description": "Claude Code plugins: a session sidebar, a progress band, a browser visual companion and a prompt cache keep-alive"
+  },
   "plugins": [
     {
       "name": "tachyons-sidebar",
       "source": "./plugins/tachyons-sidebar",
       "description": "A small right sidebar with context used, usage limits, cost, files changed and subagents spawned"
+    },
+    {
+      "name": "tachyons-progress",
+      "source": "./plugins/tachyons-progress",
+      "description": "A band above the prompt with live progress of subagents and long commands: elapsed, time left, CI jobs and video renders"
     },
     {
       "name": "tachyons-visualize",

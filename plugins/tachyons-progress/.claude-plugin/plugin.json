@@ -1,0 +1,13 @@
+{
+  "name": "tachyons-progress",
+  "version": "0.1.0",
+  "description": "A band above the prompt with live progress of subagents and long commands: elapsed, estimated time left, CI job status and video render progress",
+  "author": {
+    "name": "southstar21",
+    "url": "https://southstar21.dev"
+  },
+  "homepage": "https://github.com/southstar21dev/tachyons/tree/main/plugins/tachyons-progress",
+  "repository": "https://github.com/southstar21dev/tachyons",
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}

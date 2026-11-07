@@ -8,6 +8,7 @@
 | Plugin | What it does |
 |---|---|
 | [tachyons-sidebar](plugins/tachyons-sidebar) | A sidebar pane with context used, usage limits, cost, files changed and subagents. Shows the cache and visualize status when those plugins are installed. |
+| [tachyons-progress](plugins/tachyons-progress) | A band above the prompt with live progress: subagents with time left, long commands, CI jobs via `gh`, and ffmpeg renders. |
 | [tachyons-visualize](plugins/tachyons-visualize) | A browser companion for mockups, diagrams and A/B visual choices. Only starts when you run it. |
 | [tachyons-cache](plugins/tachyons-cache) | Keeps the prompt cache warm while the session sits idle. |
 
@@ -16,6 +17,7 @@
 ```
 /plugin marketplace add southstar21dev/tachyons
 /plugin install tachyons-sidebar@tachyons
+/plugin install tachyons-progress@tachyons
 /plugin install tachyons-visualize@tachyons
 /plugin install tachyons-cache@tachyons
 ```
