@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { AgentProgress, CiProgress, CommandProgress } from '../types'
+import type { AgentProgress, CiProgress, CommandProgress, PlanProgress, PlanStatus, PlanTask } from '../types'
 import {
   ciRunIdOf,
   ffmpegInputOf,
@@ -27,6 +27,7 @@ const ACTIVE = new Set(['pending', 'running', 'waiting'])
 
 const agents = atom({ plugin: 'tachyons-progress', key: 'agents' } as const, [])
 const commands = atom({ plugin: 'tachyons-progress', key: 'commands' } as const, [])
+const plan = atom({ plugin: 'tachyons-progress', key: 'plan' } as const, null)
 const isHidden = atom({ plugin: 'tachyons-progress', key: 'isHidden' } as const, false)
 const now = atom({ plugin: 'tachyons-progress', key: 'now' } as const, 0)
 
@@ -56,6 +57,11 @@ const STATUS_GLYPH: Record<string, [string, string]> = {
   completed: ['✓', 'success'],
   failed: ['✗', 'error'],
   killed: ['✗', 'error'],
+}
+const TASK_GLYPH: Record<PlanStatus, [string, string]> = {
+  completed: ['✓', 'success'],
+  in_progress: ['◐', 'claude'],
+  pending: ['○', 'subtle'],
 }
 const JOB_GLYPH: Record<string, [string, string]> = {
   queued: ['○', 'subtle'],
@@ -104,6 +110,47 @@ function leftSpan(estimateMs: number | undefined, elapsed: number): Span {
   if (!estimateMs) return { text: 'first run, no estimate', dim: true }
   const left = estimateMs - elapsed
   return left >= 0 ? { text: `~${duration(left)} left`, dim: true } : { text: `${duration(-left)} over estimate`, color: 'warning' }
+}
+
+/** The plan's row: a meter of tasks done, the task under way, and a glyph for every task. */
+export function planRow(p: PlanProgress, at: number): Row {
+  const total = p.tasks.length
+  const done = p.tasks.filter(t => t.status === 'completed').length
+  const current = p.tasks.find(t => t.status === 'in_progress')
+  const next = p.tasks.find(t => t.status === 'pending')
+  const isDone = p.endedAt !== undefined
+  const strip: Span[] = p.tasks.map(t => {
+    const [text, color] = TASK_GLYPH[t.status]
+    return { text, color }
+  })
+  const info: Span[] = [...strip]
+  if (isDone) info.push({ text: `  all ${total} done · ${duration(p.endedAt! - p.startedAt)}`, dim: true })
+  else if (current) info.push({ text: `  ${current.activeForm || current.subject}`, color: 'claude' })
+  else if (next) info.push({ text: `  next: ${next.subject}`, dim: true })
+  return {
+    glyph: isDone ? { text: '✓', color: 'success' } : { text: SPINNER[Math.floor(at / 1000) % SPINNER.length]!, color: 'claude' },
+    name: 'plan',
+    detail: isDone ? `${total} task${total === 1 ? '' : 's'}` : `${done} of ${total} tasks`,
+    accent: 'claude',
+    isDone,
+    fraction: isDone ? undefined : total ? done / total : 0,
+    stat: isDone ? { text: 'done', color: 'success' } : { text: `${done}/${total}`, bold: true },
+    info,
+  }
+}
+
+/** The plan after a TodoWrite: the list as written, its start kept while it goes on. */
+export function planFromTodos(old: PlanProgress | null, todos: { content: string; status: PlanStatus; activeForm?: string }[], at: number): PlanProgress | null {
+  if (todos.length === 0) return null
+  const tasks: PlanTask[] = todos.map((t, i) => ({ id: String(i + 1), subject: t.content, activeForm: t.activeForm, status: t.status }))
+  return withEnd({ tasks, startedAt: old && !old.endedAt ? old.startedAt : at }, at)
+}
+
+/** Marks the plan ended once every task is done, and open again when one is not. */
+function withEnd(p: PlanProgress, at: number): PlanProgress | null {
+  if (p.tasks.length === 0) return null
+  const isAllDone = p.tasks.every(t => t.status === 'completed')
+  return { ...p, endedAt: isAllDone ? (p.endedAt ?? at) : undefined }
 }
 
 /** The rows of the band for the progress given, at the moment `at`. */
@@ -365,6 +412,58 @@ function pollRender($: EngineInterface, id: string, command: string, file: strin
   pollers.set(id, $.clock.every(1000, () => void tick()))
 }
 
+/** Folds one task tool call into the plan: TodoWrite writes it whole, the Task tools a task at a time. */
+async function notePlan($: EngineInterface, tool: string, input: Record<string, unknown>, result: unknown) {
+  const at = Date.now()
+  const out = (result ?? {}) as Record<string, unknown>
+  if (tool === 'TodoWrite') {
+    const todos = (input.todos ?? []) as { content: string; status: PlanStatus; activeForm?: string }[]
+    await update($, plan, old => planFromTodos(old, todos, at))
+    return
+  }
+  if (tool === 'TaskCreate') {
+    const task = out.task as { id?: string; subject?: string } | undefined
+    if (!task?.id) return
+    const id = task.id
+    const entry: PlanTask = { id, subject: task.subject ?? String(input.subject ?? ''), activeForm: input.activeForm as string | undefined, status: 'pending' }
+    await update($, plan, old => {
+      const base = old && !old.endedAt ? old : { tasks: [], startedAt: at }
+      return withEnd({ ...base, tasks: [...base.tasks.filter(t => t.id !== id), entry] }, at)
+    })
+    return
+  }
+  if (tool === 'TaskUpdate') {
+    const id = String(input.taskId ?? '')
+    const status = input.status as PlanStatus | 'deleted' | undefined
+    await update($, plan, old => {
+      if (!old || !old.tasks.some(t => t.id === id)) return old
+      const tasks =
+        status === 'deleted'
+          ? old.tasks.filter(t => t.id !== id)
+          : old.tasks.map(t =>
+              t.id === id
+                ? {
+                    ...t,
+                    status: status ?? t.status,
+                    subject: (input.subject as string | undefined) ?? t.subject,
+                    activeForm: (input.activeForm as string | undefined) ?? t.activeForm,
+                  }
+                : t,
+            )
+      return withEnd({ ...old, tasks }, at)
+    })
+    return
+  }
+  // TaskList: the session's list as it stands, which also catches tasks made before a reload.
+  const listed = (out.tasks ?? []) as { id: string; subject: string; status: PlanStatus }[]
+  await update($, plan, old => {
+    if (listed.length === 0) return old && !old.endedAt ? null : old
+    const known = new Map((old?.tasks ?? []).map(t => [t.id, t]))
+    const tasks = listed.map(t => ({ ...known.get(t.id), id: t.id, subject: t.subject, status: t.status }))
+    return withEnd({ tasks, startedAt: old && !old.endedAt ? old.startedAt : at, endedAt: old?.endedAt }, at)
+  })
+}
+
 async function tickBand($: EngineInterface) {
   ticks++
   const a = await read($, agents)
@@ -373,8 +472,10 @@ async function tickBand($: EngineInterface) {
   const stale = (endedAt?: number) => endedAt !== undefined && at - endedAt > LINGER_MS
   if (a.some(x => stale(x.endedAt))) await update($, agents, list => list.filter(x => !stale(x.endedAt)))
   if (c.some(x => stale(x.endedAt))) await update($, commands, list => list.filter(x => !stale(x.endedAt)))
+  const p = await read($, plan)
+  if (p && stale(p.endedAt)) await update($, plan, () => null)
   if (ticks % 3 === 0 && (isTurnRunning || a.some(x => !x.endedAt))) await syncAgents($)
-  if (hasLive(a, c) || a.some(x => x.endedAt) || c.some(x => x.endedAt)) await update($, now, () => at)
+  if (hasLive(a, c) || p || a.some(x => x.endedAt) || c.some(x => x.endedAt)) await update($, now, () => at)
 }
 
 export const register: Register = on => {
@@ -433,6 +534,11 @@ export const register: Register = on => {
     if (e.agentId) {
       const agentId = e.agentId
       await update($, agents, list => list.map(a => (a.id === agentId ? { ...a, tools: a.tools + 1 } : a)))
+    }
+    if (e.tool === 'TodoWrite' || e.tool === 'TaskCreate' || e.tool === 'TaskUpdate' || e.tool === 'TaskList') {
+      const ran = await next(e)
+      if (ran.deny === undefined && !ran.isError) await notePlan($, e.tool, e as unknown as Record<string, unknown>, ran.result)
+      return ran
     }
     if (e.tool !== 'Bash') return next(e)
 
@@ -500,14 +606,16 @@ export const register: Register = on => {
     const at = (await read($, now)) || Date.now()
     const a = await read($, agents)
     const c = await read($, commands)
-    if (a.length === 0 && c.length === 0) return next(e)
+    const p = await read($, plan)
+    if (a.length === 0 && c.length === 0 && !p) return next(e)
 
     const order = <T extends { startedAt: number; endedAt?: number }>(rows: T[]) =>
       [...rows].sort((x, y) => Number(!!x.endedAt) - Number(!!y.endedAt) || x.startedAt - y.startedAt)
-    const rows = rowsOf(order(a), order(c), at)
+    const work = rowsOf(order(a), order(c), at)
+    const rows = p ? [planRow(p, at), ...work] : work
     const shown = rows.slice(0, MAX_ROWS)
     const running = a.filter(x => !x.endedAt).length + c.filter(x => !x.endedAt).length
-    const done = rows.length - running
+    const done = work.length - running
 
     // Columns: the frame and its padding take four cells; the glyph, name, meter and stat are fixed.
     const width = Math.max(40, e.props.bodyColumns)

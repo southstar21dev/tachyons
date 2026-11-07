@@ -13,7 +13,7 @@ import {
   withProgressFile,
 } from '../hooks/commands'
 import { clock, duration, meter, remaining } from '../hooks/format'
-import { blocks, rowsOf, sliding } from '../hooks/register'
+import { blocks, planFromTodos, planRow, rowsOf, sliding } from '../hooks/register'
 
 // The test environment has a timer; the API types do not name it.
 declare const setTimeout: (fn: () => void, ms: number) => unknown
@@ -205,4 +205,50 @@ test('a render command is given a progress file', async ($, on) => {
   })
   await $.tool.call({ tool: 'Bash', command: 'ffmpeg -i in.mp4 out.mp4', tool_use_id: 'toolu_3' } as never)
   expect(seen).toMatch(/^ffmpeg -progress '.*tachyons-progress\/toolu_3\.txt' -nostats -i in\.mp4 out\.mp4$/)
+})
+
+test('a plan row counts tasks done and names the one under way', async () => {
+  const p = planFromTodos(
+    null,
+    [
+      { content: 'Set up project', status: 'completed', activeForm: 'Setting up project' },
+      { content: 'Build login screen', status: 'in_progress', activeForm: 'Building login screen' },
+      { content: 'Write tests', status: 'pending', activeForm: 'Writing tests' },
+    ],
+    1000,
+  )!
+  const row = planRow(p, 5000)
+  expect(row.name).toBe('plan')
+  expect(row.detail).toBe('1 of 3 tasks')
+  expect(row.stat.text).toBe('1/3')
+  expect(row.fraction).toBe(1 / 3)
+  expect(row.info.map(s => s.text).join('')).toBe('✓◐○  Building login screen')
+
+  const done = planFromTodos(p, p.tasks.map(t => ({ content: t.subject, status: 'completed' as const })), 61_000)!
+  expect(done.endedAt).toBe(61_000)
+  expect(planRow(done, 61_000).stat.text).toBe('done')
+  expect(planFromTodos(p, [], 2000)).toBeNull()
+})
+
+test('the band follows TaskCreate and TaskUpdate', async ($, on) => {
+  let n = 0
+  on('tool.call', { tool: 'TaskCreate' }, ($, e) => {
+    const subject = (e as unknown as { subject: string }).subject
+    return { result: { task: { id: String(++n), subject } } as never }
+  })
+  on('tool.call', { tool: 'TaskUpdate' }, ($, e) => {
+    const taskId = (e as unknown as { taskId: string }).taskId
+    return { result: { success: true, taskId, updatedFields: ['status'] } as never }
+  })
+  await $.tool.call({ tool: 'TaskCreate', subject: 'Scaffold app', description: 'x', activeForm: 'Scaffolding app' } as never)
+  await $.tool.call({ tool: 'TaskCreate', subject: 'Add auth', description: 'x', activeForm: 'Adding auth' } as never)
+  await $.tool.call({ tool: 'TaskUpdate', taskId: '1', status: 'completed' } as never)
+  await $.tool.call({ tool: 'TaskUpdate', taskId: '2', status: 'in_progress' } as never)
+
+  const band = await $.ui.mount({ plugin: 'tachyons-progress', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
+  expect(await band.find({ type: 'Text', text: /^plan$/ })).toBeDefined()
+  expect(await band.find({ type: 'Text', text: /^1 of 2 tasks$/ })).toBeDefined()
+  expect(await band.find({ type: 'Text', text: /1\/2/ })).toBeDefined()
+  expect(await band.find({ type: 'Text', text: /Adding auth/ })).toBeDefined()
+  await band.unmount()
 })

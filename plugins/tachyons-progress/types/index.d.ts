@@ -53,11 +53,28 @@ export type CommandProgress = {
   render?: RenderProgress
 }
 
+export type PlanStatus = 'pending' | 'in_progress' | 'completed'
+export type PlanTask = {
+  id: string
+  subject: string
+  /** What the task reads as while it runs: `Building the login screen`. */
+  activeForm?: string
+  status: PlanStatus
+}
+/** The task list Claude keeps with TodoWrite or TaskCreate and TaskUpdate. */
+export type PlanProgress = {
+  tasks: PlanTask[]
+  startedAt: number
+  /** When the last task was ticked off; the row lingers a moment after. */
+  endedAt?: number
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'tachyons-progress': {
       agents: AgentProgress[]
       commands: CommandProgress[]
+      plan: PlanProgress | null
       isHidden: boolean
       /** The clock the band reads, written once a second while anything runs. */
       now: number
