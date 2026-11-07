@@ -199,12 +199,31 @@ test('the band yields to a survey and to the toggle', async ($, on) => {
 
 test('a render command is given a progress file', async ($, on) => {
   let seen = ''
+  let made = ''
+  on('fs.write', ($, e) => {
+    made = e.path
+    return { value: undefined }
+  })
   on('tool.call', ($, e) => {
     seen = (e as unknown as { command: string }).command
     return { result: { stdout: '', stderr: '', interrupted: false } as never }
   })
   await $.tool.call({ tool: 'Bash', command: 'ffmpeg -i in.mp4 out.mp4', tool_use_id: 'toolu_3' } as never)
   expect(seen).toMatch(/^ffmpeg -progress '.*tachyons-progress\/toolu_3\.txt' -nostats -i in\.mp4 out\.mp4$/)
+  expect(made).toMatch(/tachyons-progress\/toolu_3\.txt$/)
+})
+
+test('a render command runs as written when the progress file cannot be made', async ($, on) => {
+  let seen = ''
+  on('fs.write', () => {
+    throw new Error('EACCES')
+  })
+  on('tool.call', ($, e) => {
+    seen = (e as unknown as { command: string }).command
+    return { result: { stdout: '', stderr: '', interrupted: false } as never }
+  })
+  await $.tool.call({ tool: 'Bash', command: 'ffmpeg -i in.mp4 out.mp4', tool_use_id: 'toolu_4' } as never)
+  expect(seen).toBe('ffmpeg -i in.mp4 out.mp4')
 })
 
 test('a plan row counts tasks done and names the one under way', async () => {

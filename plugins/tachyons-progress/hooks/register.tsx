@@ -550,8 +550,17 @@ export const register: Register = on => {
     let input = e
     let progressFile: string | undefined
     if (kind === 'render') {
-      progressFile = `${tmpDir.replace(/\/$/, '')}/tachyons-progress/${id.replace(/[^\w-]/g, '_')}.txt`
-      input = { ...e, command: withProgressFile(command, progressFile) } as typeof e
+      const file = `${tmpDir.replace(/\/$/, '')}/tachyons-progress/${id.replace(/[^\w-]/g, '_')}.txt`
+      // ffmpeg won't make the folder and fails on a path it can't open, so make the file first;
+      // if that fails, run the command as written and show the row without a percentage.
+      const isReady = await $.fs.write(file, '').then(
+        () => true,
+        () => false,
+      )
+      if (isReady) {
+        progressFile = file
+        input = { ...e, command: withProgressFile(command, file) } as typeof e
+      }
     }
     const row: CommandProgress = {
       id,
