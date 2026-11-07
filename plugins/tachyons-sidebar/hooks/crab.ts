@@ -217,12 +217,10 @@ export function spriteRows(activity: CrabActivity, isBlinking: boolean, tick = 0
     if (r === undefined || col < 0 || col >= SPRITE_W || ch === '.') return
     rows[row] = r.slice(0, col) + ch + r.slice(col + 1)
   }
-  // The eyes close for a blink.
+  // A blink closes each eye to its lower dot, never all the way.
   if (isBlinking) {
-    for (const row of [CLAW_ROW - 1, CLAW_ROW]) {
-      put(row, 7, 'o')
-      put(row, 12, 'o')
-    }
+    put(CLAW_ROW - 1, 7, 'o')
+    put(CLAW_ROW - 1, 12, 'o')
   }
 
   // The propeller turns: blades out, then edge on.
