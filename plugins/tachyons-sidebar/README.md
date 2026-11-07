@@ -8,7 +8,7 @@ A small pane docked on the right of the terminal:
 - **Visualize**: port, current screen and clicks while a [tachyons-visualize](../tachyons-visualize) server runs
 - **Files**: files written or edited this session
 - **Agents**: subagents spawned and their status
-- A crab that naps between turns and says what Claude is doing during one
+- Clawd, who naps in a nightcap between turns and during one dresses for the job: a propeller beanie while waiting on the model, a wizard hat and wand while thinking, a top hat and quill while writing, a mortarboard and clipboard while planning, and for tools a hard hat and hammer (shell), beret and pencil (edits), deerstalker and magnifier (reading and search), pith helmet and globe (web), or captain's hat and flag (subagents)
 
 `/tachyons-sidebar` toggles the pane. It opens by itself when the terminal is wide enough to dock it.
 

@@ -12,11 +12,11 @@ A band directly above the prompt that shows what is running and how far along it
 
 ```
 ╭──────────────────────────────────────────────────────────────────────────────────────╮
-│ ◉ progress  3 running · 1 finished                                                   │
-│ ◠ Explore       find auth handlers   ███████▌░░░░   64%  1m 12s · ~40s left · 9 tools │
-│ ◠ gh run watch  CI run 42            █████▏░░░░░░   3/7  ✓ build ◐ test ○ lint · 2m   │
-│ ◠ ffmpeg        render               █████████▌░░   79%  00:41 / 00:52 · 24 fps · 1.4× │
-│ ✓ npm test      npm test             ············  done  42s                          │
+│ ◉ progress                                              ◠ 3 running   ✓ 1 finished   │
+│ ◠ Explore       find auth handlers   ━━━━━━━╸────   64%  1m 12s · ~40s left · 9 tools │
+│ ◠ gh run watch  CI run 42            ━━━━━───────   3/7  ✓ build ◐ test ○ lint · 2m   │
+│ ◠ ffmpeg        render               ━━━━━━━━━╸──   79%  00:41 / 00:52 · 24 fps · 1.4× │
+│ ✓ npm test      npm test             ━━━━━━━━━━━━  done  42s                          │
 ╰──────────────────────────────────────────────────────────────────────────────────────╯
 ```
 

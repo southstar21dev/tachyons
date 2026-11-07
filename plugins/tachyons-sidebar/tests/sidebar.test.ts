@@ -3,8 +3,9 @@ import type { Register } from 'claude-code'
 
 import { cellsOf, paintPixels, span } from '../hooks/canvas'
 import { LOGO_32, LOGO_COLORS } from '../hooks/logo'
-import { CRAB_ROWS, crabCells, toBase64 } from '../hooks/crab'
-import { meter, shortPath } from '../hooks/register'
+import { CRAB_ROWS, OUTFITS, activityOf, crabCells, spriteRows, toBase64 } from '../hooks/crab'
+import type { CrabActivity } from '../hooks/crab'
+import { heat, meter, shortPath } from '../hooks/register'
 
 const PANE_PROPS = {
   title: 'Session',
@@ -16,8 +17,11 @@ const PANE_PROPS = {
 }
 
 test('bar and paths format', async () => {
-  expect(meter(50, 10)).toEqual(['━━━━━', '╌╌╌╌╌'])
+  expect(meter(50, 10)).toEqual(['━━━━━', '─────'])
+  expect(meter(25, 10)).toEqual(['━━╸', '───────'])
   expect(meter(150, 4)).toEqual(['━━━━', ''])
+  expect(heat(0)).toBe(0x4fb37a)
+  expect(heat(1)).toBe(0xe5484d)
   expect(shortPath('/repo/src/a.ts', '/repo')).toBe('src/a.ts')
   expect(shortPath('/x/y/z/a.ts', '/repo')).toBe('…/z/a.ts')
 })
@@ -71,6 +75,33 @@ test('crab frames fill the raster in every mood', async () => {
     }
   }
   expect(toBase64(Uint32Array.of(0x2588, 0xff8800, 0x01000000))).toBe('iCUAAACI/wAAAAAB')
+})
+
+test('clawd dresses for what it is doing', async () => {
+  expect(activityOf(false, 'responding', 'Bash')).toBe('sleeping')
+  expect(activityOf(true, 'requesting')).toBe('requesting')
+  expect(activityOf(true, 'thinking')).toBe('thinking')
+  expect(activityOf(true, 'responding')).toBe('responding')
+  expect(activityOf(true, 'tool-input')).toBe('planning')
+  expect(activityOf(true, 'tool-use', 'Bash')).toBe('shell')
+  expect(activityOf(true, 'tool-use', 'Edit')).toBe('editing')
+  expect(activityOf(true, 'tool-use', 'Grep')).toBe('reading')
+  expect(activityOf(true, 'tool-use', 'WebSearch')).toBe('browsing')
+  expect(activityOf(true, 'tool-use', 'Agent')).toBe('delegating')
+  expect(activityOf(true, 'tool-use', 'mcp__x__y')).toBe('working')
+  const seen = new Set<string>()
+  for (const activity of Object.keys(OUTFITS) as CrabActivity[]) {
+    for (const tick of [0, 1]) {
+      const rows = spriteRows(activity, false, tick)
+      expect(rows.length).toBe(12)
+      expect(rows.every(r => r.length === 20)).toBe(true)
+      seen.add(rows.slice(0, 5).join('|'))
+    }
+    const mood = activity === 'sleeping' ? 'sleeping' : 'awake'
+    expect(crabCells({ mood, isBlinking: false, caption: 'x', activity, tick: 3 }, 30).length).toBe(30 * CRAB_ROWS * 3)
+  }
+  // Every outfit but the two hard hats looks different up top.
+  expect(seen.size).toBeGreaterThan(Object.keys(OUTFITS).length)
 })
 
 test('canvas cuts long lines and replaces wide characters', async () => {
@@ -165,7 +196,7 @@ test('sidebar shows tachyons-visualize while it runs', { plugins: [liveVisualize
     requestId: 'tachyons-sidebar',
     props: PANE_PROPS,
   })
-  expect(await ui.find({ type: 'Text', text: /VISUALIZE :50384/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /VISUALIZE ─+ :50384/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /live · layout-v2/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /2 screens · 1 click$/ })).toBeDefined()
   await ui.unmount()

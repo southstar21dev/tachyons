@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer, SessionContextUsage, SessionCost, SessionRateLimit } from 'claude-code'
 
 import type { AgentRow, FileChange, UsageSnap } from '../types'
-import { CRAB_ROWS, crabCells, toBase64 } from './crab'
+import { CRAB_ROWS, OUTFITS, activityOf, crabCells, toBase64 } from './crab'
 import type { CrabFrame } from './crab'
 import { INK, cellsOf, hex, paintCentered, paintPixels, span, widthOf } from './canvas'
 import { LOGO_24, LOGO_COLORS } from './logo'
@@ -15,13 +15,6 @@ const LOGO_ROWS = LOGO_24.length / 2 + 2
 const WIDTH = 34
 const EDIT_TOOLS = new Set(['Edit', 'MultiEdit', 'Write', 'NotebookEdit'])
 const LIMIT_NAMES: Record<string, string> = { five_hour: '5-hour', seven_day: '7-day', spend_limit: 'spend' }
-const MODE_WORDS: Record<string, string> = {
-  requesting: 'thinking',
-  thinking: 'pondering',
-  responding: 'writing',
-  'tool-input': 'planning',
-  'tool-use': 'crafting',
-}
 
 const files = atom({ plugin: 'tachyons-sidebar', key: 'files' } as const, [])
 const agents = atom({ plugin: 'tachyons-sidebar', key: 'agents' } as const, [])
@@ -38,14 +31,33 @@ export function snapOf(context: SessionContextUsage, rateLimits: SessionRateLimi
   }
 }
 
-/** Filled and empty halves of a meter, `width` cells in all. */
+/** Filled and empty parts of a thin meter with a half-cell end, `width` cells in all. */
 export function meter(percent: number, width: number): [string, string] {
-  const filled = Math.round((Math.min(100, Math.max(0, percent)) / 100) * width)
-  return ['━'.repeat(filled), '╌'.repeat(Math.max(0, width - filled))]
+  const cells = (Math.min(100, Math.max(0, percent)) / 100) * width
+  const whole = Math.floor(cells)
+  const filled = '━'.repeat(whole) + (whole < width && cells - whole >= 0.5 ? '╸' : '')
+  return [filled, '─'.repeat(Math.max(0, width - filled.length))]
 }
 
-function level(percent: number): number {
-  return percent >= 85 ? INK.error : percent >= 60 ? INK.warning : INK.claude
+// A meter's fill runs from calm to hot along its length, so a fuller meter ends redder.
+const HEAT: [number, number][] = [
+  [0, 0x4fb37a],
+  [0.5, 0x9fb447],
+  [0.7, 0xd9a03a],
+  [0.85, 0xe0703f],
+  [1, 0xe5484d],
+]
+
+/** The meter's color at `p` (0..1) along it. */
+export function heat(p: number): number {
+  const x = Math.min(1, Math.max(0, p))
+  let i = 0
+  while (i < HEAT.length - 2 && x > HEAT[i + 1]![0]) i++
+  const [x0, c0] = HEAT[i]!
+  const [x1, c1] = HEAT[i + 1]!
+  const t = x1 === x0 ? 0 : (x - x0) / (x1 - x0)
+  const ch = (shift: number) => Math.round(((c0 >> shift) & 0xff) + (((c1 >> shift) & 0xff) - ((c0 >> shift) & 0xff)) * t)
+  return (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
 function compact(n: number): string {
@@ -110,6 +122,8 @@ const AGENT_GLYPH: Record<string, [string, number]> = {
 const crab = {
   isWorking: false,
   mode: 'requesting',
+  /** The tool the main conversation is running now, if any: it picks Clawd's hat and tool. */
+  tool: undefined as string | undefined,
   turnStartedAt: 0,
   tick: 0,
   columns: 0,
@@ -118,9 +132,11 @@ const crab = {
 let hasActiveAgents = false
 
 function crabFrame(): CrabFrame {
-  if (!crab.isWorking) return { mood: 'sleeping', isBlinking: false, caption: 'napping' }
-  const caption = `${MODE_WORDS[crab.mode] ?? 'working'}… ${duration(Date.now() - crab.turnStartedAt)}`
-  return { mood: 'awake', isBlinking: crab.tick % 5 === 4, caption }
+  const activity = activityOf(crab.isWorking, crab.mode, crab.tool)
+  const word = OUTFITS[activity].word
+  if (!crab.isWorking) return { mood: 'sleeping', isBlinking: false, caption: word, activity, tick: crab.tick }
+  const caption = `${word}… ${duration(Date.now() - crab.turnStartedAt)}`
+  return { mood: 'awake', isBlinking: crab.tick % 5 === 4, caption, activity, tick: crab.tick }
 }
 
 function paintCrab($: EngineInterface) {
@@ -132,6 +148,7 @@ function paintCrab($: EngineInterface) {
 function wake($: EngineInterface) {
   crab.isWorking = true
   crab.mode = 'requesting'
+  crab.tool = undefined
   crab.turnStartedAt = Date.now()
   crab.tick = 0
   crab.timer?.cancel()
@@ -144,6 +161,7 @@ function wake($: EngineInterface) {
 
 function sleep($: EngineInterface) {
   crab.isWorking = false
+  crab.tool = undefined
   crab.timer?.cancel()
   crab.timer = undefined
   paintCrab($)
@@ -219,14 +237,31 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // The spinner says what the turn is doing; the caption names it.
+  // The spinner says what the turn is doing; Clawd dresses for it.
   on('ui.render', { component: 'Spinner' }, ($, e, next) => {
-    crab.mode = e.props.mode
+    if (crab.mode !== e.props.mode) {
+      crab.mode = e.props.mode
+      paintCrab($)
+    }
     return next(e)
   })
 
   on('tool.call', async ($, e, next) => {
-    const ran = await next(e)
+    // The main conversation's tool picks Clawd's outfit while it runs.
+    const isMain = !e.agentId && crab.isWorking
+    if (isMain) {
+      crab.tool = e.tool
+      paintCrab($)
+    }
+    let ran: Awaited<ReturnType<typeof next>>
+    try {
+      ran = await next(e)
+    } finally {
+      if (isMain && crab.tool === e.tool) {
+        crab.tool = undefined
+        paintCrab($)
+      }
+    }
     await update($, stats, s => ({ ...s, tools: s.tools + 1 }))
 
     if (EDIT_TOOLS.has(e.tool) && ran.deny === undefined && !ran.isError) {
@@ -272,16 +307,26 @@ export const register: Register = on => {
 
     const lines: Line[] = []
     const blank = () => lines.push([])
+    // `◉ TITLE ──────── meta`: the rule fills the row and the figure sits at its right end.
     const heading = (icon: string, title: string, meta?: string) => {
       const head: Line = [span(`${icon} `, INK.claude), span(title.toUpperCase())]
-      if (meta) head.push(span(` ${meta}`, INK.muted))
-      head.push(span(' ' + '─'.repeat(Math.max(0, width - widthOf(head) - 1)), INK.faint))
+      const tail = meta ? ` ${meta}` : ''
+      head.push(span(' ' + '─'.repeat(Math.max(1, width - widthOf(head) - tail.length - 1)), INK.faint))
+      if (meta) head.push(span(tail, INK.muted))
       lines.push(head)
     }
     const meterLine = (percent: number, cells: number): Line => {
       const [full, empty] = meter(percent, cells)
-      return [span(full, level(percent)), span(empty, INK.faint)]
+      const line: Line = [...full].map((ch, i) => span(ch, heat(i / Math.max(1, cells - 1))))
+      line.push(span(empty, INK.faint))
+      return line
     }
+    // A row with `left` against the left edge and `right` against the right one.
+    const spread = (left: Line, right: Line): Line => [
+      ...left,
+      span(' '.repeat(Math.max(1, width - widthOf(left) - widthOf(right)))),
+      ...right,
+    ]
 
     blank()
     heading('◉', 'Context', pct === undefined ? undefined : `${Math.round(pct)}%`)
@@ -303,9 +348,9 @@ export const register: Register = on => {
       lines.push([
         span(label, INK.muted),
         ...meterLine(l.percentUsed, Math.max(4, width - label.length - pctText.length)),
-        span(pctText),
+        span(pctText, l.percentUsed >= 85 ? INK.error : l.percentUsed >= 60 ? INK.warning : INK.text),
       ])
-      if (l.resetsAt) lines.push([span(' '.repeat(label.length) + resetLabel(l.resetsAt), INK.faint)])
+      if (l.resetsAt) lines.push([span(' '.repeat(label.length)), span('↻ ', INK.faint), span(resetLabel(l.resetsAt), INK.faint)])
     }
     if (u?.costUsd !== undefined) lines.push([span(`$${u.costUsd.toFixed(2)}`), span(' spent this session', INK.muted)])
 
@@ -340,16 +385,16 @@ export const register: Register = on => {
     heading('✎', 'Files', fileList.length ? `${fileList.length} · ${totalEdits} edits` : undefined)
     if (fileList.length === 0) lines.push([span('nothing changed yet', INK.muted)])
     for (const f of fileList.slice(0, fileRoom)) {
-      const count = f.edits > 1 ? ` ×${f.edits}` : ''
-      const [dir, name] = splitPath(shortPath(f.path, cwd), width - 2 - count.length)
-      lines.push([
-        span(f.isNew ? '+ ' : '~ ', f.isNew ? INK.success : INK.warning),
-        span(dir, INK.muted),
-        span(name),
-        span(count, INK.muted),
-      ])
+      const count = f.edits > 1 ? `×${f.edits}` : ''
+      const [dir, name] = splitPath(shortPath(f.path, cwd), width - 2 - (count ? count.length + 1 : 0))
+      lines.push(
+        spread(
+          [span(f.isNew ? '+ ' : '~ ', f.isNew ? INK.success : INK.warning), span(dir, INK.faint), span(name)],
+          [span(count, INK.muted)],
+        ),
+      )
     }
-    if (fileList.length > fileRoom) lines.push([span(`  +${fileList.length - fileRoom} more`, INK.muted)])
+    if (fileList.length > fileRoom) lines.push([span(`  … ${fileList.length - fileRoom} more`, INK.faint)])
 
     blank()
     heading('◇', 'Agents', agentList.length ? `${agentList.length} · ${active} active` : undefined)
@@ -362,13 +407,16 @@ export const register: Register = on => {
         span(` ${fit(a.description, Math.max(1, width - a.type.length - 3))}`, INK.muted),
       ])
     }
-    if (agentList.length > agentRoom) lines.push([span(`  +${agentList.length - agentRoom} earlier`, INK.muted)])
+    if (agentList.length > agentRoom) lines.push([span(`  … ${agentList.length - agentRoom} earlier`, INK.faint)])
 
     blank()
     lines.push([span('─'.repeat(width), INK.faint)])
-    lines.push([
-      span(`${s.turns} turns · ${s.tools} tools${s.startedAt ? ` · ${duration(Date.now() - s.startedAt)}` : ''}`, INK.muted),
-    ])
+    lines.push(
+      spread(
+        [span(`${s.turns}`), span(` turn${s.turns === 1 ? '' : 's'} · `, INK.muted), span(`${s.tools}`), span(` tool${s.tools === 1 ? '' : 's'}`, INK.muted)],
+        s.startedAt ? [span('◷ ', INK.claude), span(duration(Date.now() - s.startedAt), INK.muted)] : [],
+      ),
+    )
 
     if (e.surface === 'terminal') {
       const { Box, Raster } = $.ui.resolve(e)
@@ -393,7 +441,7 @@ export const register: Register = on => {
     const { Box, Text } = $.ui.resolve(e)
     return (
       <Box flexDirection="column">
-        <Text color="claude">{crab.isWorking ? '(\\/)(°,,,°)(\\/)  working…' : '(\\/)(-,,,-)(\\/)  zzz'}</Text>
+        <Text color="claude">{crab.isWorking ? `(\\/)(°,,,°)(\\/)  ${crabFrame().caption}` : '(\\/)(-,,,-)(\\/)  zzz'}</Text>
         {lines.map(line => (
           <Text wrap="truncate-end">
             {line.length === 0 ? ' ' : line.map(part => <Text color={hex(part.color)}>{part.text}</Text>)}

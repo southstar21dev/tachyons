@@ -1,6 +1,6 @@
 {
   "name": "tachyons-progress",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A band above the prompt with live progress of subagents and long commands: elapsed, estimated time left, CI job status and video render progress",
   "author": {
     "name": "southstar21",

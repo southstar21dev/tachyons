@@ -1,6 +1,6 @@
 {
   "name": "tachyons-sidebar",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "description": "A small right sidebar with context used, usage limits, cost, files changed and subagents spawned",
   "author": {
     "name": "southstar21",

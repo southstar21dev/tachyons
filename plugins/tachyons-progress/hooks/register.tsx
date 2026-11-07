@@ -42,10 +42,13 @@ export type Row = {
   /** The short figure beside the meter: `64%`, `3/7`, `done`. */
   stat: Span
   info: Span[]
+  /** The name's color: what kind of work the row is. */
+  accent?: string
+  /** The row has ended: it is drawn quieter, its meter full. */
+  isDone?: boolean
 }
 
 const SPINNER = ['◜', '◠', '◝', '◞', '◡', '◟']
-const EIGHTHS = ['', '▏', '▎', '▍', '▌', '▋', '▊', '▉']
 const STATUS_GLYPH: Record<string, [string, string]> = {
   pending: ['○', 'subtle'],
   waiting: ['◔', 'warning'],
@@ -62,23 +65,22 @@ const JOB_GLYPH: Record<string, [string, string]> = {
   skipped: ['–', 'subtle'],
 }
 
-/** A meter `width` cells wide with eighth-block ends: the filled and the empty part. */
+/** A thin line meter `width` cells wide with a half-cell end: the filled and the empty part. */
 export function blocks(fraction: number, width: number): [string, string] {
   const f = Math.min(1, Math.max(0, fraction))
   const cells = f * width
   const whole = Math.floor(cells)
-  const part = EIGHTHS[Math.round((cells - whole) * 8) % 8] ?? ''
-  const filled = '█'.repeat(whole) + (whole < width ? part : '')
-  return [filled, '░'.repeat(Math.max(0, width - filled.length))]
+  const filled = '━'.repeat(whole) + (whole < width && cells - whole >= 0.5 ? '╸' : '')
+  return [filled, '─'.repeat(Math.max(0, width - filled.length))]
 }
 
-/** A meter with no fraction to show: a three-cell block sliding across it, one cell a second. */
+/** A meter with no fraction to show: a three-cell segment gliding along the track, one cell a second. */
 export function sliding(at: number, width: number): [string, string, string] {
   const span = Math.min(3, width)
   const travel = Math.max(1, width - span)
   const step = Math.floor(at / 1000) % (travel * 2)
   const left = step < travel ? step : travel * 2 - step
-  return ['░'.repeat(left), '█'.repeat(span), '░'.repeat(Math.max(0, width - left - span))]
+  return ['─'.repeat(left), '━'.repeat(span), '─'.repeat(Math.max(0, width - left - span))]
 }
 
 /** How far along a row is, 0..1, or undefined when nothing says. */
@@ -117,6 +119,8 @@ export function rowsOf(agentRows: AgentProgress[], commandRows: CommandProgress[
         glyph: runningGlyph(at, a.status),
         name: a.type || 'agent',
         detail: a.description,
+        accent: 'claude',
+        isDone: true,
         stat: { text: a.status === 'completed' ? 'done' : a.status, color: a.status === 'completed' ? 'success' : 'error' },
         info: [{ text: duration(elapsed) }, dot, tools],
       })
@@ -127,6 +131,7 @@ export function rowsOf(agentRows: AgentProgress[], commandRows: CommandProgress[
       glyph: runningGlyph(at, a.status),
       name: a.type || 'agent',
       detail: a.description,
+      accent: 'claude',
       fraction,
       stat: fraction === undefined ? { text: '', dim: true } : { text: `${Math.round(fraction * 100)}%`, bold: true },
       info: [{ text: duration(elapsed), bold: true }, dot, a.status === 'waiting' ? { text: 'waiting on you', color: 'warning' } : leftSpan(a.estimateMs, elapsed), dot, tools],
@@ -138,12 +143,15 @@ export function rowsOf(agentRows: AgentProgress[], commandRows: CommandProgress[
     const status = c.endedAt ? (c.isError ? 'failed' : 'completed') : 'running'
     const glyph = runningGlyph(at, status)
     const background: Span[] = c.isBackground && !c.endedAt ? [dot, { text: 'background', dim: true }] : []
+    const accent = c.kind === 'ci' ? 'suggestion' : c.kind === 'render' ? 'merged' : undefined
 
     if (c.endedAt) {
       rows.push({
         glyph,
         name: c.label,
         detail: c.kind === 'ci' ? 'CI' : c.kind === 'render' ? 'render' : c.command,
+        accent,
+        isDone: true,
         stat: c.isError ? { text: 'failed', color: 'error' } : { text: 'done', color: 'success' },
         info: [{ text: duration(elapsed) }],
       })
@@ -168,6 +176,7 @@ export function rowsOf(agentRows: AgentProgress[], commandRows: CommandProgress[
         glyph,
         name: c.label,
         detail: ci.runId ? `CI run ${ci.runId}` : 'CI',
+        accent,
         fraction,
         stat: ci.total ? { text: `${ci.done}/${ci.total}`, bold: true, color: ci.conclusion === 'failure' ? 'error' : undefined } : { text: '…', dim: true },
         info,
@@ -185,6 +194,7 @@ export function rowsOf(agentRows: AgentProgress[], commandRows: CommandProgress[
         glyph,
         name: c.label,
         detail: 'render',
+        accent,
         fraction,
         stat: fraction === undefined ? { text: '…', dim: true } : { text: `${Math.round(fraction * 100)}%`, bold: true },
         info,
@@ -516,15 +526,59 @@ export const register: Register = on => {
           {part.text}
         </Text>
       ))
-    const summary = [running ? `${running} running` : '', done ? `${done} finished` : ''].filter(Boolean).join(' · ')
+    const failed = c.filter(x => x.endedAt && x.isError).length + a.filter(x => x.endedAt && x.status !== 'completed').length
+    const meterOf = (row: Row) => {
+      if (row.isDone) {
+        const color = row.stat.color === 'error' ? 'error' : 'success'
+        return <Text color={color} dimColor>{'━'.repeat(meterWidth)}</Text>
+      }
+      if (row.fraction === undefined) {
+        const [before, segment, after] = sliding(at, meterWidth)
+        return (
+          <Text>
+            <Text dimColor>{before}</Text>
+            <Text color={row.accent ?? 'claude'}>{segment}</Text>
+            <Text dimColor>{after}</Text>
+          </Text>
+        )
+      }
+      const [filled, empty] = blocks(row.fraction, meterWidth)
+      return (
+        <Text>
+          <Text color={row.fraction >= 1 ? 'success' : (row.accent ?? 'claude')}>{filled}</Text>
+          <Text dimColor>{empty}</Text>
+        </Text>
+      )
+    }
 
     return (
-      <Box flexDirection="column" width={width} borderStyle="round" borderDimColor paddingX={1}>
-        <Box flexDirection="row">
+      <Box flexDirection="column" width={width} borderStyle="round" borderColor="claude" borderDimColor paddingX={1}>
+        <Box flexDirection="row" justifyContent="space-between">
           <Text color="claude" bold>
             ◉ progress
           </Text>
-          <Text dimColor>{`  ${summary}`}</Text>
+          <Box flexDirection="row" gap={2}>
+            {running ? (
+              <Text>
+                <Text color="claude">{`${SPINNER[Math.floor(at / 1000) % SPINNER.length]} `}</Text>
+                <Text>{`${running} running`}</Text>
+              </Text>
+            ) : null}
+            {done - failed > 0 ? (
+              <Text>
+                <Text color="success">✓ </Text>
+                <Text dimColor>{`${done} finished`}</Text>
+              </Text>
+            ) : done ? (
+              <Text dimColor>{`${done} finished`}</Text>
+            ) : null}
+            {failed ? (
+              <Text>
+                <Text color="error">✗ </Text>
+                <Text color="error">{`${failed} failed`}</Text>
+              </Text>
+            ) : null}
+          </Box>
         </Box>
         {shown.map(row => (
           <Box flexDirection="row">
@@ -532,7 +586,7 @@ export const register: Register = on => {
               <Text color={row.glyph.color}>{row.glyph.text}</Text>
             </Box>
             <Box width={nameWidth + 1}>
-              <Text wrap="truncate-end" bold>
+              <Text wrap="truncate-end" bold={!row.isDone} dimColor={row.isDone} color={row.isDone ? undefined : row.accent}>
                 {fit(row.name, nameWidth)}
               </Text>
             </Box>
@@ -543,35 +597,20 @@ export const register: Register = on => {
                 </Text>
               </Box>
             ) : null}
-            <Box width={meterWidth + 1}>
-              {row.fraction === undefined ? (
-                row.stat.text === 'done' || row.stat.text === 'failed' ? (
-                  <Text dimColor>{'·'.repeat(meterWidth)}</Text>
-                ) : (
-                  <Text>
-                    <Text dimColor>{sliding(at, meterWidth)[0]}</Text>
-                    <Text color="claude">{sliding(at, meterWidth)[1]}</Text>
-                    <Text dimColor>{sliding(at, meterWidth)[2]}</Text>
-                  </Text>
-                )
-              ) : (
-                <Text>
-                  <Text color={row.fraction >= 1 ? 'success' : 'claude'}>{blocks(row.fraction, meterWidth)[0]}</Text>
-                  <Text dimColor>{blocks(row.fraction, meterWidth)[1]}</Text>
-                </Text>
-              )}
-            </Box>
+            <Box width={meterWidth + 1}>{meterOf(row)}</Box>
             <Box width={statWidth + 2}>
               <Text color={row.stat.color} dimColor={row.stat.dim} bold={row.stat.bold}>
                 {row.stat.text.padStart(statWidth)}
               </Text>
             </Box>
             <Box width={infoWidth}>
-              <Text wrap="truncate-end">{spans(row.info)}</Text>
+              <Text wrap="truncate-end" dimColor={row.isDone}>
+                {spans(row.info)}
+              </Text>
             </Box>
           </Box>
         ))}
-        {rows.length > shown.length ? <Text dimColor>{`  +${rows.length - shown.length} more`}</Text> : null}
+        {rows.length > shown.length ? <Text dimColor>{`  ⋯ ${rows.length - shown.length} more`}</Text> : null}
       </Box>
     )
   })
