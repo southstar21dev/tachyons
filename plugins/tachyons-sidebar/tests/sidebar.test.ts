@@ -1,11 +1,10 @@
 import { expect, test } from 'claude-code/testing'
 import type { Register } from 'claude-code'
 
-import { cellsOf, paintPixels, span } from '../hooks/canvas'
-import { LOGO_32, LOGO_COLORS } from '../hooks/logo'
+import { cellsOf, span } from '../hooks/canvas'
 import { CRAB_ROWS, OUTFITS, activityOf, crabCells, spriteRows, toBase64 } from '../hooks/crab'
 import type { CrabActivity } from '../hooks/crab'
-import { heat, limitLabel, mergeLimits, meter, parseUsage, shortPath } from '../hooks/register'
+import { commitsSection, diffCounts, editCounts, heat, parseLog, limitLabel, mergeLimits, meter, parseUsage, shortPath } from '../hooks/register'
 
 const PANE_PROPS = {
   title: 'Session',
@@ -62,7 +61,7 @@ test('sidebar shows edited files and usage', async ($, on) => {
   on('tool.call', () => ({ result: {} as never }))
   on('session.measure', ($, e) => ({ changed: e.changed }))
 
-  await $.tool.call({ tool: 'Write', file_path: '/tmp/new.ts', content: 'x' } as never)
+  await $.tool.call({ tool: 'Write', file_path: '/tmp/new.ts', content: 'x\ny\nz\n' } as never)
   await $.tool.call({ tool: 'Edit', file_path: '/tmp/old.ts', old_string: 'a', new_string: 'b' } as never)
   await $.tool.call({ tool: 'Edit', file_path: '/tmp/old.ts', old_string: 'b', new_string: 'c' } as never)
   await $.session.measure({
@@ -90,12 +89,55 @@ test('sidebar shows edited files and usage', async ($, on) => {
     requestId: 'tachyons-sidebar',
     props: PANE_PROPS,
   })
-  expect(await ui.find({ type: 'Text', text: /2 · 3 edits/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /FILES.*2 · \+5 -2/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /old\.ts.*\+2 -2/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /new\.ts/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /25%/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /5-hour.*42%/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /50k of 200k tokens/ })).toBeDefined()
   await ui.unmount()
+})
+
+test('lines added and removed are counted per edit', async () => {
+  expect(diffCounts('a\nb\nc\n', 'a\nB\nB2\nc\n')).toEqual({ added: 2, removed: 1 })
+  expect(diffCounts('', 'x')).toEqual({ added: 1, removed: 0 })
+  expect(diffCounts('same', 'same')).toEqual({ added: 0, removed: 0 })
+  const patch = [{ oldStart: 1, oldLines: 3, newStart: 1, newLines: 4, lines: [' a', '-b', '+B', '+B2', ' c'] }]
+  expect(editCounts('Edit', {}, { structuredPatch: patch })).toEqual({ added: 2, removed: 1 })
+  expect(editCounts('Write', { content: 'a\nb' }, { type: 'create', structuredPatch: [], originalFile: null })).toEqual({ added: 2, removed: 0 })
+  expect(editCounts('Write', { content: 'a\nc' }, { type: 'update', structuredPatch: [], originalFile: 'a\nb' })).toEqual({ added: 1, removed: 1 })
+  expect(editCounts('NotebookEdit', {}, { edit_mode: 'replace', old_source: 'x\ny', new_source: 'x\nz' })).toEqual({ added: 1, removed: 1 })
+  expect(editCounts('Edit', { old_string: 'a', new_string: 'b' }, { staged: true })).toBeUndefined()
+})
+
+test('git log becomes commit rows', async () => {
+  const out =
+    '\x1edd3dc8a\x1f1794309601\x1ftachyons-progress: end rows\n\n 6 files changed, 342 insertions(+), 19 deletions(-)\n' +
+    '\x1ece8f6fa\x1f1794309557\x1fdocs only\n\n 1 file changed, 1 insertion(+)\n' +
+    '\x1e255521c\x1f1794014969\x1fempty\n'
+  expect(parseLog(out)).toEqual([
+    { hash: 'dd3dc8a', subject: 'tachyons-progress: end rows', at: 1794309601000, added: 342, removed: 19 },
+    { hash: 'ce8f6fa', subject: 'docs only', at: 1794309557000, added: 1, removed: 0 },
+    { hash: '255521c', subject: 'empty', at: 1794014969000, added: 0, removed: 0 },
+  ])
+  expect(parseLog('')).toEqual([])
+})
+
+test('the commits section lists what a push would send, then says all is pushed', async () => {
+  const text = (lines: ReturnType<typeof commitsSection>) => lines.map(l => l.map(p => p.text).join(''))
+  const ahead = text(
+    commitsSection({ total: 7, rows: [{ hash: 'abc1234', subject: 'add the thing', at: 0, added: 12, removed: 3 }] }, 32),
+  )
+  expect(ahead[1]).toMatch(/^⎇ COMMITS ─+ 7 to push$/)
+  expect(ahead[2]).toMatch(/^abc1234 add the thing +\+12 -3$/)
+  expect(ahead[2]!.length).toBe(32)
+  expect(ahead[3]).toBe('  … 6 more')
+  expect(text(commitsSection({ total: 0, rows: [] }, 32))[2]).toBe('✓ everything pushed')
+  expect(commitsSection(null, 32)).toEqual([])
+  // A long subject is cut so the counts keep their place.
+  const long = text(commitsSection({ total: 1, rows: [{ hash: 'abc1234', subject: 'x'.repeat(80), at: 0, added: 1, removed: 0 }] }, 32))
+  expect(long[2]).toMatch(/x… \+1$/)
+  expect(long[2]!.length).toBe(32)
 })
 
 test('crab frames fill the raster in every mood', async () => {
@@ -140,15 +182,6 @@ test('canvas cuts long lines and replaces wide characters', async () => {
   const cells = cellsOf([[span('ab漢😀cdef')]], 5, 1)
   const chars = [0, 1, 2, 3, 4].map(i => String.fromCodePoint(cells[i * 3]!))
   expect(chars.join('')).toBe('ab??…')
-})
-
-test('the logo is painted centred at the row asked', async () => {
-  const cells = cellsOf([], 36, 10)
-  paintPixels(cells, 36, LOGO_32, LOGO_COLORS, 2)
-  const at = (row: number, col: number) => cells[(row * 36 + col) * 3]!
-  // Rows above it stay blank; its first pixel row starts 2 cells in (centred: (36 - 32) / 2).
-  expect([...Array(36).keys()].every(col => at(1, col) === 0x20)).toBe(true)
-  expect(at(2, 2 + 9)).toBe(0x2580)
 })
 
 const cacheMod = {

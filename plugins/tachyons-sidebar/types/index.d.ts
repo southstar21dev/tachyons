@@ -1,4 +1,12 @@
-export type FileChange = { path: string; edits: number; isNew: boolean; at: number }
+export type FileChange = {
+  path: string
+  edits: number
+  isNew: boolean
+  at: number
+  /** Lines added and removed across this session's edits (absent on rows stored before they were counted). */
+  added?: number
+  removed?: number
+}
 export type AgentRow = { id: string; type: string; description: string; status: string }
 export type LimitRow = { kind: string; percentUsed: number; resetsAt?: string }
 export type UsageSnap = {
@@ -11,6 +19,9 @@ export type UsageSnap = {
   polledAt?: number
 }
 export type Stats = { tools: number; turns: number; startedAt: number }
+export type CommitRow = { hash: string; subject: string; at: number; added: number; removed: number }
+/** Commits on HEAD that no remote has yet, newest first; `total` counts past the rows kept. */
+export type LocalCommits = { rows: CommitRow[]; total: number }
 
 declare module 'claude-code' {
   interface PluginState {
@@ -19,6 +30,8 @@ declare module 'claude-code' {
       agents: AgentRow[]
       usage: UsageSnap | null
       stats: Stats
+      /** Null outside a git repository. */
+      commits: LocalCommits | null
     }
   }
 }

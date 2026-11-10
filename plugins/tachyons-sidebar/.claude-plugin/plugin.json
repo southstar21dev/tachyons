@@ -1,7 +1,7 @@
 {
   "name": "tachyons-sidebar",
-  "version": "0.2.1",
-  "description": "A small right sidebar with context used, usage limits, cost, files changed and subagents spawned",
+  "version": "0.3.0",
+  "description": "A small right sidebar with context used, usage limits, cost, files changed, subagents spawned and commits not yet pushed",
   "author": {
     "name": "southstar21",
     "url": "https://southstar21.dev"

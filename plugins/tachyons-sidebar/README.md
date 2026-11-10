@@ -6,8 +6,9 @@ A small pane docked on the right of the terminal:
 - **Limits**: 5-hour, 7-day, per-model weekly (Fable, Opus, Sonnet) and spend limits with reset times, plus session cost. They are refreshed in the background every minute (and after each turn) from the account's usage endpoint, so they move between turns too; if the endpoint can't be reached the meters fall back to what the last reply reported
 - **Cache**: keep-alive state, when [tachyons-cache](../tachyons-cache) is installed
 - **Visualize**: port, current screen and clicks while a [tachyons-visualize](../tachyons-visualize) server runs
-- **Files**: files written or edited this session
+- **Files**: files written or edited this session, each with the lines it added (green) and removed (red), and the totals in the heading
 - **Agents**: subagents spawned and their status
+- **Commits**: at the foot of the pane, the local commits a push would send (on HEAD, on no remote yet), each with its lines added and removed. They leave once pushed; it reads `everything pushed` then, and stays hidden outside a git repository. Refreshed every 15 seconds, after each shell command and after each turn
 - Clawd, who naps in a nightcap between turns and during one dresses for the job: a propeller beanie while waiting on the model, a wizard hat and wand while thinking, a top hat and quill while writing, a mortarboard and clipboard while planning, and for tools a hard hat and hammer (shell), beret and pencil (edits), deerstalker and magnifier (reading and search), pith helmet and globe (web), or captain's hat and flag (subagents)
 
 `/tachyons-sidebar` toggles the pane. It opens by itself when the terminal is wide enough to dock it.

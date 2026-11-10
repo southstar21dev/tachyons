@@ -1,22 +1,24 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer, SessionContextUsage, SessionCost, SessionRateLimit } from 'claude-code'
 
-import type { AgentRow, FileChange, LimitRow, UsageSnap } from '../types'
+import type { AgentRow, CommitRow, FileChange, LimitRow, LocalCommits, UsageSnap } from '../types'
 import { CRAB_ROWS, OUTFITS, activityOf, crabCells, toBase64 } from './crab'
 import type { CrabFrame } from './crab'
-import { INK, cellsOf, hex, paintCentered, paintPixels, span, widthOf } from './canvas'
-import { LOGO_24, LOGO_COLORS } from './logo'
+import { INK, cellsOf, hex, span, widthOf } from './canvas'
 import type { Line } from './canvas'
 
 const PANE = 'tachyons-sidebar'
 const TITLE = 'Session'
-// The logo's half-block rows, the southstar21.dev line under it, and a blank row at the bottom.
-const LOGO_ROWS = LOGO_24.length / 2 + 2
 const WIDTH = 34
 const EDIT_TOOLS = new Set(['Edit', 'MultiEdit', 'Write', 'NotebookEdit'])
 const LIMIT_NAMES: Record<string, string> = { five_hour: '5-hour', seven_day: '7-day', spend_limit: 'spend' }
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
 const POLL_MS = 60_000
+// Commits are read again this often, so a push from another terminal clears them.
+const GIT_POLL_MS = 15_000
+const COMMIT_ROWS = 5
+// Commits on HEAD that no remote branch has: they are what a push would send.
+const LOG_ARGS = ['--format=%x1e%h%x1f%ct%x1f%s', '--shortstat', 'HEAD', '--not', '--remotes']
 
 /** `seven_day_fable` reads `7d fable`; kinds without a name of their own are spelled out. */
 export function limitLabel(kind: string): string {
@@ -72,10 +74,98 @@ export function mergeLimits(reported: LimitRow[], polled: LimitRow[]): LimitRow[
   return [...byKind.values()]
 }
 
+function linesOf(text: string): string[] {
+  if (text === '') return []
+  const lines = text.split('\n')
+  if (lines[lines.length - 1] === '') lines.pop()
+  return lines
+}
+
+/** Lines added and removed going from `before` to `after`, the common head and tail set aside. */
+export function diffCounts(before: string, after: string): { added: number; removed: number } {
+  const a = linesOf(before)
+  const b = linesOf(after)
+  let head = 0
+  while (head < a.length && head < b.length && a[head] === b[head]) head++
+  let tail = 0
+  while (tail < a.length - head && tail < b.length - head && a[a.length - 1 - tail] === b[b.length - 1 - tail]) tail++
+  return { added: b.length - head - tail, removed: a.length - head - tail }
+}
+
+type Hunk = { lines?: unknown }
+
+/**
+ * Lines one edit added and removed: from the tool's own diff when it gave one,
+ * else worked out from what it was asked to write. `undefined` when nothing was written.
+ */
+export function editCounts(tool: string, input: Record<string, unknown>, result: unknown): { added: number; removed: number } | undefined {
+  const r = (typeof result === 'object' && result !== null ? result : {}) as Record<string, unknown>
+  if (r.staged === true) return undefined
+  const str = (v: unknown) => (typeof v === 'string' ? v : undefined)
+  const patch = Array.isArray(r.structuredPatch) ? (r.structuredPatch as Hunk[]) : []
+  if (patch.length > 0) {
+    let added = 0
+    let removed = 0
+    for (const hunk of patch) {
+      for (const line of Array.isArray(hunk?.lines) ? hunk.lines : []) {
+        if (typeof line !== 'string') continue
+        if (line.startsWith('+')) added++
+        else if (line.startsWith('-')) removed++
+      }
+    }
+    return { added, removed }
+  }
+  if (tool === 'Write') {
+    const content = str(r.content) ?? str(input.content) ?? ''
+    const original = str(r.originalFile)
+    if (original !== undefined) return diffCounts(original, content)
+    // An update whose old text was too large to diff: nothing to count from.
+    return r.type === 'update' ? { added: 0, removed: 0 } : { added: linesOf(content).length, removed: 0 }
+  }
+  if (tool === 'NotebookEdit') {
+    const mode = str(r.edit_mode) ?? str(input.edit_mode)
+    const before = str(r.old_source) ?? ''
+    const after = mode === 'delete' ? '' : (str(r.new_source) ?? str(input.new_source) ?? '')
+    return diffCounts(before, after)
+  }
+  if (tool === 'MultiEdit' && Array.isArray(input.edits)) {
+    let added = 0
+    let removed = 0
+    for (const edit of input.edits as Record<string, unknown>[]) {
+      const d = diffCounts(str(edit?.old_string) ?? '', str(edit?.new_string) ?? '')
+      added += d.added
+      removed += d.removed
+    }
+    return { added, removed }
+  }
+  return diffCounts(str(r.oldString) ?? str(input.old_string) ?? '', str(r.newString) ?? str(input.new_string) ?? '')
+}
+
+/** `git log --format=%x1e%h%x1f%ct%x1f%s --shortstat` as rows, newest first. */
+export function parseLog(out: string): CommitRow[] {
+  const rows: CommitRow[] = []
+  for (const chunk of out.split('\x1e')) {
+    const [head = '', ...rest] = chunk.split('\n')
+    const [hash, at, ...subject] = head.split('\x1f')
+    if (!hash || !at) continue
+    const stat = rest.join(' ')
+    const num = (re: RegExp) => Number(re.exec(stat)?.[1] ?? 0)
+    rows.push({
+      hash,
+      subject: subject.join('\x1f'),
+      at: Number(at) * 1000,
+      added: num(/(\d+) insertions?\(\+\)/),
+      removed: num(/(\d+) deletions?\(-\)/),
+    })
+  }
+  return rows
+}
+
 const files = atom({ plugin: 'tachyons-sidebar', key: 'files' } as const, [])
 const agents = atom({ plugin: 'tachyons-sidebar', key: 'agents' } as const, [])
 const usage = atom({ plugin: 'tachyons-sidebar', key: 'usage' } as const, null)
 const stats = atom({ plugin: 'tachyons-sidebar', key: 'stats' } as const, { tools: 0, turns: 0, startedAt: 0 })
+const commits = atom({ plugin: 'tachyons-sidebar', key: 'commits' } as const, null)
 
 export function snapOf(context: SessionContextUsage, rateLimits: SessionRateLimit[], cost?: SessionCost): UsageSnap {
   return {
@@ -163,6 +253,42 @@ function fit(text: string, width: number): string {
   return text.length > width ? text.slice(0, Math.max(1, width - 1)) + '…' : text
 }
 
+/** `◉ TITLE ──────── meta`: the rule fills the row and the figure sits at its right end. */
+function headingLine(width: number, icon: string, title: string, meta?: string | Line): Line {
+  const head: Line = [span(`${icon} `, INK.claude), span(title.toUpperCase())]
+  const tail: Line = meta === undefined ? [] : [span(' '), ...(typeof meta === 'string' ? [span(meta, INK.muted)] : meta)]
+  head.push(span(' ' + '─'.repeat(Math.max(1, width - widthOf(head) - widthOf(tail) - 1)), INK.faint))
+  return [...head, ...tail]
+}
+
+/** `+12 -3`: lines added in green and removed in red, a side left out when it is nothing. */
+function delta(added: number, removed: number): Line {
+  const parts: Line = []
+  if (added) parts.push(span(`+${compact(added)}`, INK.success))
+  if (removed) parts.push(span(`${parts.length ? ' ' : ''}-${compact(removed)}`, INK.error))
+  return parts
+}
+
+/** A row with `left` against the left edge and `right` against the right one. */
+function spread(width: number, left: Line, right: Line): Line {
+  return [...left, span(' '.repeat(Math.max(1, width - widthOf(left) - widthOf(right)))), ...right]
+}
+
+/** The rows the Commits section takes for what a push would send: none outside a repository. */
+export function commitsSection(git: LocalCommits | null, width: number): Line[] {
+  if (!git) return []
+  const lines: Line[] = [[], headingLine(width, '⎇', 'Commits', git.total ? `${git.total} to push` : undefined)]
+  if (git.total === 0) lines.push([span('✓ ', INK.success), span('everything pushed', INK.muted)])
+  const shown = git.rows.slice(0, COMMIT_ROWS)
+  for (const c of shown) {
+    const right = delta(c.added, c.removed)
+    const room = width - c.hash.length - 1 - (widthOf(right) ? widthOf(right) + 1 : 0)
+    lines.push(spread(width, [span(c.hash, INK.claude), span(' '), span(fit(c.subject, Math.max(1, room)))], right))
+  }
+  if (git.total > shown.length) lines.push([span(`  … ${git.total - shown.length} more`, INK.faint)])
+  return lines
+}
+
 const AGENT_GLYPH: Record<string, [string, number]> = {
   pending: ['○', INK.muted],
   running: ['◐', INK.claude],
@@ -218,6 +344,28 @@ async function refreshLimits($: EngineInterface) {
     poll.failures++
   } finally {
     poll.isBusy = false
+  }
+}
+
+let isReadingGit = false
+
+/** Reads the commits a push would send; writes only when they changed, so an idle pane stays still. */
+async function refreshCommits($: EngineInterface) {
+  if (isReadingGit) return
+  isReadingGit = true
+  try {
+    const count = await $.process.run(['git', 'rev-list', '--count', 'HEAD', '--not', '--remotes'], { timeoutMs: 5000 })
+    let next: LocalCommits | null = null
+    if (count.exitCode === 0) {
+      const total = Number(count.stdout.trim()) || 0
+      const log = total ? await $.process.run(['git', 'log', `-n${COMMIT_ROWS * 4}`, ...LOG_ARGS], { timeoutMs: 5000 }) : undefined
+      next = { rows: log?.exitCode === 0 ? parseLog(log.stdout) : [], total }
+    }
+    await update($, commits, old => (JSON.stringify(old) === JSON.stringify(next) ? old : next))
+  } catch {
+    // git missing or slow: keep what was shown.
+  } finally {
+    isReadingGit = false
   }
 }
 
@@ -292,6 +440,8 @@ export const register: Register = on => {
     $.clock.every(5000, () => {
       if (crab.isWorking || hasActiveAgents) void syncAgents($)
     })
+    void refreshCommits($)
+    $.clock.every(GIT_POLL_MS, () => void refreshCommits($))
     // Limits are polled in the background, backing off while the endpoint refuses.
     $.clock.every(POLL_MS, () => {
       poll.ticks++
@@ -334,6 +484,7 @@ export const register: Register = on => {
       void syncAgents($)
       void refreshLimits($)
     }
+    void refreshCommits($)
     return next(e)
   })
 
@@ -365,22 +516,28 @@ export const register: Register = on => {
     await update($, stats, s => ({ ...s, tools: s.tools + 1 }))
 
     if (EDIT_TOOLS.has(e.tool) && ran.deny === undefined && !ran.isError) {
-      const raw = e as unknown as { file_path?: string; notebook_path?: string }
+      const raw = e as unknown as Record<string, unknown> & { file_path?: string; notebook_path?: string }
       const path = raw.file_path ?? raw.notebook_path
-      if (path) {
+      const counts = editCounts(e.tool, raw, ran.result)
+      if (path && counts) {
         await update($, files, list => {
           const old = list.find(f => f.path === path)
+          const created = (ran.result as { type?: unknown } | undefined)?.type
           const entry: FileChange = {
             path,
             edits: (old?.edits ?? 0) + 1,
-            isNew: old ? old.isNew : e.tool === 'Write',
+            isNew: old ? old.isNew : e.tool === 'Write' && created !== 'update',
             at: Date.now(),
+            added: (old?.added ?? 0) + counts.added,
+            removed: (old?.removed ?? 0) + counts.removed,
           }
           return [entry, ...list.filter(f => f.path !== path)].slice(0, 200)
         })
       }
     }
     if (e.tool === 'Agent') void syncAgents($)
+    // A commit, push, reset or checkout most often comes through the shell.
+    if (e.tool === 'Bash') void refreshCommits($)
 
     return ran
   })
@@ -391,6 +548,7 @@ export const register: Register = on => {
     const fileList = await read($, files)
     const agentList = await read($, agents)
     const s = await read($, stats)
+    const git = await read($, commits)
     const { value: cache } = await $.state.get({ plugin: 'tachyons-cache', key: 'status' })
     const { value: viz } = await $.state.get({ plugin: 'tachyons-visualize', key: 'status' })
     const isVisualizing = viz?.isRunning === true
@@ -399,35 +557,23 @@ export const register: Register = on => {
     const pct =
       u?.contextPercent ?? (u?.contextTokens && u.contextWindow ? (u.contextTokens / u.contextWindow) * 100 : undefined)
     const active = agentList.filter(a => a.status === 'running' || a.status === 'pending' || a.status === 'waiting').length
-    const totalEdits = fileList.reduce((n, f) => n + f.edits, 0)
-    const fixedRows = CRAB_ROWS + 16 + (u?.limits.length ?? 0) * 2 + 1 + LOGO_ROWS + (cache ? 4 : 0) + (isVisualizing ? 4 : 0)
+    const totalAdded = fileList.reduce((n, f) => n + (f.added ?? 0), 0)
+    const totalRemoved = fileList.reduce((n, f) => n + (f.removed ?? 0), 0)
+    const commitLines = commitsSection(git, width)
+    const fixedRows = CRAB_ROWS + 16 + (u?.limits.length ?? 0) * 2 + 1 + commitLines.length + (cache ? 4 : 0) + (isVisualizing ? 4 : 0)
     const spare = Math.max(2, bodyRows - fixedRows)
     const agentRoom = Math.min(agentList.length, Math.max(1, Math.floor(spare / 2)))
     const fileRoom = Math.max(1, spare - agentRoom)
 
     const lines: Line[] = []
     const blank = () => lines.push([])
-    // `◉ TITLE ──────── meta`: the rule fills the row and the figure sits at its right end.
-    const heading = (icon: string, title: string, meta?: string) => {
-      const head: Line = [span(`${icon} `, INK.claude), span(title.toUpperCase())]
-      const tail = meta ? ` ${meta}` : ''
-      head.push(span(' ' + '─'.repeat(Math.max(1, width - widthOf(head) - tail.length - 1)), INK.faint))
-      if (meta) head.push(span(tail, INK.muted))
-      lines.push(head)
-    }
+    const heading = (icon: string, title: string, meta?: string | Line) => lines.push(headingLine(width, icon, title, meta))
     const meterLine = (percent: number, cells: number): Line => {
       const [full, empty] = meter(percent, cells)
       const line: Line = [...full].map((ch, i) => span(ch, heat(i / Math.max(1, cells - 1))))
       line.push(span(empty, INK.faint))
       return line
     }
-    // A row with `left` against the left edge and `right` against the right one.
-    const spread = (left: Line, right: Line): Line => [
-      ...left,
-      span(' '.repeat(Math.max(1, width - widthOf(left) - widthOf(right)))),
-      ...right,
-    ]
-
     blank()
     heading('◉', 'Context', pct === undefined ? undefined : `${Math.round(pct)}%`)
     if (pct === undefined) lines.push([span('waiting for the first reply', INK.muted)])
@@ -484,17 +630,18 @@ export const register: Register = on => {
     }
 
     blank()
-    heading('✎', 'Files', fileList.length ? `${fileList.length} · ${totalEdits} edits` : undefined)
+    const totals = delta(totalAdded, totalRemoved)
+    heading(
+      '✎',
+      'Files',
+      fileList.length ? [span(`${fileList.length}`), ...(totals.length ? [span(' · ', INK.muted), ...totals] : [])] : undefined,
+    )
     if (fileList.length === 0) lines.push([span('nothing changed yet', INK.muted)])
     for (const f of fileList.slice(0, fileRoom)) {
-      const count = f.edits > 1 ? `×${f.edits}` : ''
-      const [dir, name] = splitPath(shortPath(f.path, cwd), width - 2 - (count ? count.length + 1 : 0))
-      lines.push(
-        spread(
-          [span(f.isNew ? '+ ' : '~ ', f.isNew ? INK.success : INK.warning), span(dir, INK.faint), span(name)],
-          [span(count, INK.muted)],
-        ),
-      )
+      const right = delta(f.added ?? 0, f.removed ?? 0)
+      const room = widthOf(right)
+      const [dir, name] = splitPath(shortPath(f.path, cwd), width - 2 - (room ? room + 1 : 0))
+      lines.push(spread(width, [span(f.isNew ? '+ ' : '~ ', f.isNew ? INK.success : INK.warning), span(dir, INK.faint), span(name)], right))
     }
     if (fileList.length > fileRoom) lines.push([span(`  … ${fileList.length - fileRoom} more`, INK.faint)])
 
@@ -515,23 +662,24 @@ export const register: Register = on => {
     lines.push([span('─'.repeat(width), INK.faint)])
     lines.push(
       spread(
+        width,
         [span(`${s.turns}`), span(` turn${s.turns === 1 ? '' : 's'} · `, INK.muted), span(`${s.tools}`), span(` tool${s.tools === 1 ? '' : 's'}`, INK.muted)],
         s.startedAt ? [span('◷ ', INK.claude), span(duration(Date.now() - s.startedAt), INK.muted)] : [],
       ),
     )
+
+    // Commits a push would send sit at the foot of the pane, and leave it once pushed.
+    const commitsFrom = lines.length
+    lines.push(...commitLines)
 
     if (e.surface === 'terminal') {
       const { Box, Raster } = $.ui.resolve(e)
       crab.columns = width
       // Fill every row of the body so the dock's tint never shows through.
       const statsRows = Math.min(256, Math.max(lines.length, bodyRows - CRAB_ROWS))
-      const cells = cellsOf(lines, width, statsRows)
-      // The logo sits at the bottom centre, where the body has room under the stats.
-      const logoTop = statsRows - LOGO_ROWS
-      if (logoTop > lines.length) {
-        paintPixels(cells, width, LOGO_24, LOGO_COLORS, logoTop)
-        paintCentered(cells, width, logoTop + LOGO_24.length / 2, 'southstar21.dev', LOGO_COLORS.r!)
-      }
+      // The commits drop to the bottom of the body, the spare rows above them.
+      const gap: Line[] = Array.from({ length: statsRows - lines.length }, () => [])
+      const cells = cellsOf([...lines.slice(0, commitsFrom), ...gap, ...lines.slice(commitsFrom)], width, statsRows)
       return (
         <Box flexDirection="column">
           <Raster key="crab" columns={width} rows={CRAB_ROWS} cells={toBase64(crabCells(crabFrame(), width))} />
