@@ -9,6 +9,8 @@ export type AgentProgress = {
   tools: number
   /** Median duration of earlier agents of the same type, when any ran. */
   estimateMs?: number
+  /** `$.agent.list` has shown this agent; once it drops off the list, the agent is gone. */
+  isListed?: boolean
 }
 
 export type CiJobStatus = 'queued' | 'running' | 'done' | 'failed' | 'skipped'
@@ -41,14 +43,22 @@ export type CommandProgress = {
   label: string
   /** The command line, cut for display. */
   command: string
+  /** The line as it ran (cut to 1000), to know it again in the engine's list of background work. */
+  runCommand?: string
+  /** The subagent that ran it; undefined for the main thread. */
+  agentId?: string
   kind: CommandKind
   startedAt: number
   endedAt?: number
   isBackground: boolean
   taskId?: string
   isError?: boolean
-  /** Median duration of earlier runs of the same label, when any ran. */
+  /** Median duration of earlier runs of the same label, when any ran; the line's own `sleep`s when it has them. */
   estimateMs?: number
+  /** The estimate is the line's `sleep`s, not history: the run is not remembered under its label. */
+  isSleepEstimate?: boolean
+  /** A background command the engine no longer tracks, gone without a task notification. */
+  isLost?: boolean
   ci?: CiProgress
   render?: RenderProgress
 }

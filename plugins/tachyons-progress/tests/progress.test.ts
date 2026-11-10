@@ -3,6 +3,7 @@ import { expect, test } from 'claude-code/testing'
 import {
   ciRunIdOf,
   ffmpegInputOf,
+  ffmpegSpanMs,
   firstCommand,
   kindOf,
   labelOf,
@@ -10,6 +11,7 @@ import {
   parseFfmpegProgress,
   parseGhRun,
   parseTaskNotification,
+  sleepMsOf,
   withProgressFile,
 } from '../hooks/commands'
 import { clock, duration, meter, remaining } from '../hooks/format'
@@ -269,5 +271,132 @@ test('the band follows TaskCreate and TaskUpdate', async ($, on) => {
   expect(await band.find({ type: 'Text', text: /^1 of 2 tasks$/ })).toBeDefined()
   expect(await band.find({ type: 'Text', text: /1\/2/ })).toBeDefined()
   expect(await band.find({ type: 'Text', text: /Adding auth/ })).toBeDefined()
+  await band.unmount()
+})
+
+test('a line that sleeps is estimated by its sleeps', async () => {
+  expect(sleepMsOf('sleep 150; printf "sitemap"')).toBe(150_000)
+  expect(sleepMsOf('cd app && sleep 2m && curl x')).toBe(120_000)
+  expect(sleepMsOf('sleep 1m 30s; ls')).toBe(90_000)
+  expect(sleepMsOf('sleep 5 && sleep 0.5')).toBe(5500)
+  expect(sleepMsOf('while ! curl -s x; do sleep 5; done')).toBeUndefined()
+  expect(sleepMsOf('npm test')).toBeUndefined()
+  expect(sleepMsOf('echo "no sleep 5 here"')).toBeUndefined()
+})
+
+test('a sleeping command shows its sleep as the estimate', async ($, on) => {
+  let release = () => {}
+  const gate = new Promise<void>(resolve => (release = resolve))
+  on('tool.call', async () => {
+    await gate
+    return { result: { stdout: '', stderr: '', interrupted: false } as never }
+  })
+  const running = $.tool.call({ tool: 'Bash', command: 'sleep 150; echo done', tool_use_id: 'toolu_s' } as never)
+  await new Promise<void>(resolve => setTimeout(() => resolve(), 50))
+  const live = await $.ui.mount({ plugin: 'tachyons-progress', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
+  expect(await live.find({ type: 'Text', text: /~2m 30s left|~2m 29s left/ })).toBeDefined()
+  await live.unmount()
+  release()
+  await running
+})
+
+test('a background command the engine no longer tracks leaves the band', async ($, on) => {
+  on('tool.call', { tool: 'Bash' }, ($, e) => {
+    const id = (e as unknown as { tool_use_id: string }).tool_use_id
+    return { result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: `task_${id}` } as never }
+  })
+  on('classic.Stop', () => ({}) as never)
+  on('tool.call', { tool: 'TaskStop' }, ($, e) => {
+    const taskId = (e as unknown as { task_id: string }).task_id
+    return { result: { message: 'stopped', task_id: taskId, task_type: 'local_bash' } as never }
+  })
+  await $.tool.call({ tool: 'Bash', command: 'python3 -m http.server 8731', tool_use_id: 'b1', run_in_background: true } as never)
+  await $.tool.call({ tool: 'Bash', command: 'python3 -m http.server 8843', tool_use_id: 'b2', run_in_background: true } as never)
+  await $.tool.call({ tool: 'Bash', command: 'npm run dev', tool_use_id: 'b3', run_in_background: true } as never)
+
+  const before = await $.ui.mount({ plugin: 'tachyons-progress', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
+  expect(await before.find({ type: 'Text', text: /3 running/ })).toBeDefined()
+  await before.unmount()
+
+  // b1 died on its own: the stop's in-flight list no longer has it.
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [
+    { id: 'task_b2', type: 'shell', status: 'running', description: 'server' },
+    { id: 'task_b3', type: 'shell', status: 'running', description: 'dev' },
+  ] } as never)
+  // b2 was stopped.
+  await $.tool.call({ tool: 'TaskStop', task_id: 'task_b2' } as never)
+
+  const after = await $.ui.mount({ plugin: 'tachyons-progress', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
+  expect(await after.find({ type: 'Text', text: /1 running/ })).toBeDefined()
+  expect(await after.find({ type: 'Text', text: /2 finished/ })).toBeDefined()
+  expect(await after.find({ type: 'Text', text: /ended/ })).toBeDefined()
+  await after.unmount()
+})
+
+test('an ffmpeg line measures only the part it writes', async () => {
+  expect(ffmpegSpanMs('ffmpeg -i in.mp4 out.mp4', 60_000)).toBe(60_000)
+  expect(ffmpegSpanMs('ffmpeg -ss 10 -i in.mp4 out.mp4', 60_000)).toBe(50_000)
+  expect(ffmpegSpanMs('ffmpeg -i in.mp4 -t 5 out.mp4', 60_000)).toBe(5000)
+  expect(ffmpegSpanMs('ffmpeg -ss 00:00:10 -i in.mp4 -to 00:00:30 out.mp4', 60_000)).toBe(20_000)
+  expect(ffmpegSpanMs('ffmpeg -i - -t 1:30 out.mp4', undefined)).toBe(90_000)
+  expect(ffmpegSpanMs('ffmpeg -i - out.mp4', undefined)).toBeUndefined()
+})
+
+const bandText = async ($: any) => {
+  const band = await $.ui.mount({ plugin: 'tachyons-progress', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
+  return band
+}
+
+test('a refused command leaves no row; an interrupted one ends without failing', async ($, on) => {
+  on('tool.call', { tool: 'Bash' }, ($, e) => {
+    const command = (e as unknown as { command: string }).command
+    if (command.startsWith('rm')) return { deny: 'no' } as never
+    return { result: { stdout: '', stderr: '', interrupted: true } as never }
+  })
+  await $.tool.call({ tool: 'Bash', command: 'rm -rf build', tool_use_id: 'd1' } as never)
+  await $.tool.call({ tool: 'Bash', command: 'npm test', tool_use_id: 'd2' } as never)
+  const band = await bandText($)
+  expect(await band.find({ type: 'Text', text: /rm -rf/ })).toBeUndefined()
+  expect(await band.find({ type: 'Text', text: /ended/ })).toBeDefined()
+  expect(await band.find({ type: 'Text', text: /failed/ })).toBeUndefined()
+  await band.unmount()
+})
+
+test('a notification after a sweep restores how the command went', async ($, on) => {
+  on('classic.Stop', () => ({}) as never)
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'bg1' } as never }))
+  await $.tool.call({ tool: 'Bash', command: 'npm run build', tool_use_id: 'n1', run_in_background: true } as never)
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as never)
+  let band = await bandText($)
+  expect(await band.find({ type: 'Text', text: /ended/ })).toBeDefined()
+  await band.unmount()
+  await $.session.append({ message: { role: 'user', content: [{ type: 'text', text: '<task-notification><task-id>bg1</task-id><status>failed</status></task-notification>' }] } } as never)
+  band = await bandText($)
+  expect(await band.find({ type: 'Text', text: /failed/ })).toBeDefined()
+  await band.unmount()
+})
+
+test('a listed command keeps its row though its id is spelled differently', async ($, on) => {
+  on('classic.Stop', () => ({}) as never)
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'bg2' } as never }))
+  await $.tool.call({ tool: 'Bash', command: 'python3 -m http.server 9000', tool_use_id: 'k1', run_in_background: true } as never)
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [
+    { id: 'other-id', type: 'shell', status: 'running', description: 'x', command: 'python3 -m http.server 9000' },
+  ] } as never)
+  const band = await bandText($)
+  expect(await band.find({ type: 'Text', text: /1 running/ })).toBeDefined()
+  await band.unmount()
+})
+
+test("a subagent's TodoWrite leaves the plan alone", async ($, on) => {
+  on('ui.render', { component: 'AbovePrompt' }, $ => {
+    const { Text } = $.ui.resolve({ surface: 'terminal', component: 'AbovePrompt' } as never)
+    return h(Text, {}, 'engine band') as never
+  })
+  on('tool.call', { tool: 'TodoWrite' }, () => ({ result: {} as never }))
+  await $.tool.call({ tool: 'TodoWrite', agentId: 'sub1', todos: [{ content: 'x', status: 'pending', activeForm: 'x' }] } as never)
+  const band = await bandText($)
+  expect(await band.find({ type: 'Text', text: /^plan$/ })).toBeUndefined()
+  expect(await band.find({ type: 'Text', text: /engine band/ })).toBeDefined()
   await band.unmount()
 })

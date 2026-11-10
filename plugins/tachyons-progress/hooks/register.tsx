@@ -5,6 +5,7 @@ import type { AgentProgress, CiProgress, CommandProgress, PlanProgress, PlanStat
 import {
   ciRunIdOf,
   ffmpegInputOf,
+  ffmpegSpanMs,
   kindOf,
   labelOf,
   median,
@@ -12,6 +13,7 @@ import {
   parseGhRun,
   parseTaskNotification,
   shortCommand,
+  sleepMsOf,
   withProgressFile,
 } from './commands'
 import { clock, duration, fit, remaining } from './format'
@@ -199,7 +201,7 @@ export function rowsOf(agentRows: AgentProgress[], commandRows: CommandProgress[
         detail: c.kind === 'ci' ? 'CI' : c.kind === 'render' ? 'render' : c.command,
         accent,
         isDone: true,
-        stat: c.isError ? { text: 'failed', color: 'error' } : { text: 'done', color: 'success' },
+        stat: c.isError ? { text: 'failed', color: 'error' } : c.isLost ? { text: 'ended', dim: true } : { text: 'done', color: 'success' },
         info: [{ text: duration(elapsed) }],
       })
       continue
@@ -280,12 +282,22 @@ async function remember($: EngineInterface, label: string, ms: number) {
 }
 
 async function syncAgents($: EngineInterface) {
-  const live = await $.agent.list().catch(() => [])
-  if (live.length === 0) return
+  // A failed read says nothing; an empty list says every agent it once showed is gone.
+  const live = await $.agent.list().catch(() => undefined)
+  if (!live) return
   const at = Date.now()
   await update($, agents, list => {
     const byId = new Map(list.map(a => [a.id, a]))
+    const listed = new Set(live.map(a => a.id))
     let changed = false
+    // The engine dropped an agent it had listed, with no turn.complete: it was stopped or lost.
+    // Agents never listed (a workflow's) end by their turn.complete alone.
+    for (const a of list) {
+      if (a.isListed && !a.endedAt && !listed.has(a.id)) {
+        byId.set(a.id, { ...a, endedAt: at, status: 'killed' })
+        changed = true
+      }
+    }
     for (const a of live) {
       const old = byId.get(a.id)
       const isActive = ACTIVE.has(a.status)
@@ -299,6 +311,7 @@ async function syncAgents($: EngineInterface) {
           startedAt: at,
           tools: 0,
           estimateMs: estimateFor(`agent:${a.type}`),
+          isListed: true,
         })
         changed = true
         continue
@@ -310,8 +323,15 @@ async function syncAgents($: EngineInterface) {
         status: a.status,
         estimateMs: old.estimateMs ?? estimateFor(`agent:${a.type}`),
         endedAt: old.endedAt ?? (isActive ? undefined : at),
+        isListed: true,
       }
-      if (next.type !== old.type || next.description !== old.description || next.status !== old.status || next.endedAt !== old.endedAt) {
+      if (
+        next.type !== old.type ||
+        next.description !== old.description ||
+        next.status !== old.status ||
+        next.endedAt !== old.endedAt ||
+        !old.isListed
+      ) {
         byId.set(a.id, next)
         changed = true
       }
@@ -324,7 +344,11 @@ async function patchCommand($: EngineInterface, id: string, fn: (c: CommandProgr
   await update($, commands, list => list.map(c => (c.id === id ? fn(c) : c)))
 }
 
-async function finishCommand($: EngineInterface, id: string, isError: boolean) {
+/**
+ * Ends a command's row. `isLost`: the engine stopped tracking it without saying how it ended
+ * (stopped, or its process died), so it is neither a failure nor a duration worth remembering.
+ */
+async function finishCommand($: EngineInterface, id: string, isError: boolean, isLost = false) {
   pollers.get(id)?.cancel()
   pollers.delete(id)
   const at = Date.now()
@@ -332,12 +356,50 @@ async function finishCommand($: EngineInterface, id: string, isError: boolean) {
   await update($, commands, list =>
     list.map(c => {
       if (c.id !== id || c.endedAt) return c
-      done = { ...c, endedAt: at, isError }
+      done = { ...c, endedAt: at, isError, ...(isLost ? { isLost } : {}) }
       return done
     }),
   )
-  if (done && !isError) await remember($, done.label, at - done.startedAt)
+  if (done && !isError && !isLost && !done.isSleepEstimate) await remember($, done.label, at - done.startedAt)
 }
+
+// The engine caps a listed command at 1000 characters with a `... [+N chars]` marker; compare a safe prefix.
+const COMMAND_KEY = 900
+const commandKey = (text: string) => text.replace(/\.\.\. \[\+\d+ chars\]$/, '').slice(0, COMMAND_KEY)
+
+/**
+ * Ends every background row whose task is not among the engine's in-flight tasks.
+ * A row counts as live when its task id or its command line is listed, so an id
+ * spelled differently in the list never ends a running command. `agentId` limits
+ * the check to one subagent's rows (its stop may list only its own work).
+ */
+async function dropLostBackground(
+  $: EngineInterface,
+  inFlight: readonly { id: string; command?: string }[] | undefined,
+  scope?: { agentId: string },
+) {
+  if (!Array.isArray(inFlight)) return
+  const ids = new Set(inFlight.map(t => t.id))
+  const lines = new Set(inFlight.flatMap(t => (t.command ? [commandKey(t.command)] : [])))
+  const list = await read($, commands)
+  for (const c of list) {
+    if (!c.isBackground || !c.taskId || c.endedAt) continue
+    if (scope && c.agentId !== scope.agentId) continue
+    if (ids.has(c.taskId) || (c.runCommand && lines.has(commandKey(c.runCommand)))) continue
+    await finishCommand($, c.id, false, true)
+  }
+}
+
+/** Ends the foreground rows a finished turn left running: their call never came back. */
+async function dropOrphans($: EngineInterface, agentId: string | undefined, before: number) {
+  const list = await read($, commands)
+  for (const c of list) {
+    if (!c.isBackground && !c.endedAt && c.agentId === agentId && c.startedAt <= before) await finishCommand($, c.id, false, true)
+  }
+}
+
+/** A task notification's status: `completed`, a failure, or a stop that is neither. */
+const isStopStatus = (status: string) => status === 'killed' || status === 'stopped' || status === 'cancelled'
 
 async function readCi($: EngineInterface, id: string, runId: string | undefined): Promise<string | undefined> {
   if (!runId) {
@@ -405,7 +467,7 @@ function pollRender($: EngineInterface, id: string, command: string, file: strin
   const tick = async () => {
     if (!hasProbed) {
       hasProbed = true
-      durationMs = await probeDuration($, command)
+      durationMs = ffmpegSpanMs(command, await probeDuration($, command))
     }
     await readRender($, id, file, durationMs)
   }
@@ -513,6 +575,11 @@ export const register: Register = on => {
   })
 
   on('turn.complete', async ($, e, next) => {
+    // A call that never came back (an interrupt that dropped it) would spin forever; give a late
+    // result a moment to land, then end what this turn left running.
+    const ended = Date.now()
+    const turnAgent = e.agentId
+    $.clock.after(3000, () => void dropOrphans($, turnAgent, ended).catch(() => {}))
     if (!e.agentId) isTurnRunning = false
     else {
       const at = Date.now()
@@ -535,9 +602,26 @@ export const register: Register = on => {
       const agentId = e.agentId
       await update($, agents, list => list.map(a => (a.id === agentId ? { ...a, tools: a.tools + 1 } : a)))
     }
-    if (e.tool === 'TodoWrite' || e.tool === 'TaskCreate' || e.tool === 'TaskUpdate' || e.tool === 'TaskList') {
+    // A subagent's TodoWrite is its own list, not the session's plan; the Task tools share one list.
+    const isPlanTool = e.tool === 'TodoWrite' ? !e.agentId : e.tool === 'TaskCreate' || e.tool === 'TaskUpdate' || e.tool === 'TaskList'
+    if (isPlanTool) {
       const ran = await next(e)
       if (ran.deny === undefined && !ran.isError) await notePlan($, e.tool, e as unknown as Record<string, unknown>, ran.result)
+      return ran
+    }
+    if (e.tool === 'TaskStop') {
+      const ran = await next(e)
+      const raw = e as unknown as { task_id?: string; shell_id?: string }
+      const stopped = (ran.result as { task_id?: string } | undefined)?.task_id ?? raw.task_id ?? raw.shell_id
+      if (ran.deny === undefined && !ran.isError && stopped) {
+        const hit = (await read($, commands)).find(c => c.taskId === stopped && !c.endedAt)
+        if (hit) await finishCommand($, hit.id, false, true)
+        // TaskStop also stops background agents by id.
+        const at = Date.now()
+        await update($, agents, list =>
+          list.some(a => a.id === stopped && !a.endedAt) ? list.map(a => (a.id === stopped && !a.endedAt ? { ...a, endedAt: at, status: 'killed' } : a)) : list,
+        )
+      }
       return ran
     }
     if (e.tool !== 'Bash') return next(e)
@@ -562,14 +646,19 @@ export const register: Register = on => {
         input = { ...e, command: withProgressFile(command, file) } as typeof e
       }
     }
+    // A line that sleeps says how long it waits; that beats the history of whatever its label is.
+    const sleepMs = kind === 'shell' ? sleepMsOf(command) : undefined
     const row: CommandProgress = {
       id,
       label,
       command: shortCommand(command, 120),
+      runCommand: (input as unknown as { command?: string }).command?.slice(0, 1000) ?? command.slice(0, 1000),
+      ...(e.agentId ? { agentId: e.agentId } : {}),
       kind,
       startedAt: Date.now(),
       isBackground: false,
-      estimateMs: estimateFor(label),
+      estimateMs: sleepMs && sleepMs >= 1000 ? sleepMs : estimateFor(label),
+      ...(sleepMs && sleepMs >= 1000 ? { isSleepEstimate: true } : {}),
     }
     await update($, commands, list => [...list.filter(c => c.id !== id), row].slice(-24))
     if (kind === 'ci') pollCi($, id, command)
@@ -582,12 +671,23 @@ export const register: Register = on => {
       await finishCommand($, id, true)
       throw err
     }
-    const result = ran.deny === undefined ? (ran.result as { backgroundTaskId?: string } | undefined) : undefined
+    if (ran.deny !== undefined) {
+      // Refused (by a hook or the person): it never ran, so it leaves no row.
+      pollers.get(id)?.cancel()
+      pollers.delete(id)
+      await update($, commands, list => list.filter(c => c.id !== id))
+      return ran
+    }
+    const result = ran.result as { backgroundTaskId?: string; interrupted?: boolean } | undefined
     if (result?.backgroundTaskId) {
       const taskId = result.backgroundTaskId
-      await patchCommand($, id, c => ({ ...c, isBackground: true, taskId }))
+      // Sent to the background (also by Ctrl+B or an abort): running again even if a sweep ended it.
+      await patchCommand($, id, c => ({ ...c, isBackground: true, taskId, endedAt: undefined, isLost: undefined, isError: undefined }))
+    } else if (result?.interrupted) {
+      // Cut short: not a failure, and not a duration worth remembering.
+      await finishCommand($, id, false, true)
     } else {
-      await finishCommand($, id, ran.deny !== undefined || ran.isError === true)
+      await finishCommand($, id, ran.isError === true)
     }
     return ran
   })
@@ -604,9 +704,33 @@ export const register: Register = on => {
     const note = parseTaskNotification(text)
     if (note) {
       const list = await read($, commands)
-      const hit = list.find(c => c.taskId === note.taskId && !c.endedAt)
-      if (hit) await finishCommand($, hit.id, note.status !== 'completed')
+      const hit = list.find(c => c.taskId === note.taskId && (!c.endedAt || c.isLost))
+      const isStop = isStopStatus(note.status)
+      if (hit && !hit.endedAt) await finishCommand($, hit.id, note.status !== 'completed' && !isStop, isStop)
+      else if (hit && !isStop) {
+        // A sweep ended it as lost before its notification came: the notification knows how it went.
+        const isError = note.status !== 'completed'
+        await patchCommand($, hit.id, c => ({ ...c, isLost: undefined, isError }))
+        if (!isError && !hit.isSleepEstimate) await remember($, hit.label, Date.now() - hit.startedAt)
+      }
     }
+    return next(e)
+  })
+
+  // /clear starts the conversation over: the old task list goes with it.
+  on('classic.SessionStart', async ($, e, next) => {
+    if (e.source === 'clear') await update($, plan, () => null)
+    return next(e)
+  })
+
+  // A background shell can end with no notification (stopped from /tasks, killed, its process gone).
+  // Each stop lists the work still in flight; a background row missing from it has ended.
+  on('classic.Stop', async ($, e, next) => {
+    await dropLostBackground($, e.background_tasks).catch(() => {})
+    return next(e)
+  })
+  on('classic.SubagentStop', async ($, e, next) => {
+    await dropLostBackground($, e.background_tasks, { agentId: e.agent_id }).catch(() => {})
     return next(e)
   })
 

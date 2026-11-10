@@ -41,6 +41,28 @@ export function kindOf(command: string): CommandKind {
   return 'shell'
 }
 
+const SLEEP_UNIT_MS: Record<string, number> = { '': 1000, s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 }
+
+/**
+ * How long the `sleep`s of a line wait in all, when it has any: `sleep 150; curl …` waits 150 s.
+ * A loop repeats its sleep an unknown number of times, so a line with one gives no figure.
+ */
+export function sleepMsOf(command: string): number | undefined {
+  if (/(^|&&|\|\|?|;|\(|\n)[ \t]*(?:while|until|for)\s/.test(command)) return undefined
+  let total = 0
+  let found = false
+  const re = /(?:^|&&|\|\|?|;|\(|\n)[ \t]*sleep[ \t]+((?:\d+(?:\.\d+)?[smhd]?[ \t]*)+)/g
+  for (let m = re.exec(command); m; m = re.exec(command)) {
+    for (const arg of m[1]!.trim().split(/\s+/)) {
+      const parsed = /^(\d+(?:\.\d+)?)([smhd]?)$/.exec(arg)
+      if (!parsed) continue
+      total += Number(parsed[1]) * SLEEP_UNIT_MS[parsed[2]!]!
+      found = true
+    }
+  }
+  return found ? Math.round(total) : undefined
+}
+
 /** The run id named on the line (`gh run watch 123`, `--run 123`), if any. */
 export function ciRunIdOf(command: string): string | undefined {
   return /\bgh\s+run\s+(?:watch|view)\s+(\d+)/.exec(command)?.[1]
@@ -64,6 +86,34 @@ function hmsToMs(text: string): number | undefined {
   if (!m) return undefined
   const ms = (Number(m[2]) * 3600 + Number(m[3]) * 60 + Number(m[4])) * 1000
   return m[1] ? 0 : Math.round(ms)
+}
+
+/** An ffmpeg time: `90`, `1.5`, `01:30`, `00:01:30.5`, `500ms`, `2s`. */
+function ffmpegTimeToMs(text: string): number | undefined {
+  const t = text.replace(/^["']|["']$/g, '')
+  let m = /^(\d+(?:\.\d+)?)(ms|us|s)?$/.exec(t)
+  if (m) return Math.round(Number(m[1]) * (m[2] === 'ms' ? 1 : m[2] === 'us' ? 0.001 : 1000))
+  m = /^(\d+):(\d+(?:\.\d+)?)$/.exec(t)
+  if (m) return Math.round((Number(m[1]) * 60 + Number(m[2])) * 1000)
+  return hmsToMs(t)
+}
+
+/**
+ * How much of the input an ffmpeg line writes, from its full length: `-ss` skips the start,
+ * `-t` caps the length, `-to` stops at a time. Ignores options it cannot read.
+ */
+export function ffmpegSpanMs(command: string, inputMs: number | undefined): number | undefined {
+  const opt = (name: string) => {
+    const m = new RegExp(`\\s-${name}\\s+(\\S+)`).exec(command)
+    return m ? ffmpegTimeToMs(m[1]!) : undefined
+  }
+  const start = opt('ss') ?? 0
+  const length = opt('t')
+  const to = opt('to')
+  let span = inputMs !== undefined ? Math.max(0, inputMs - start) : undefined
+  if (to !== undefined) span = Math.min(span ?? Infinity, Math.max(0, to - start))
+  if (length !== undefined) span = Math.min(span ?? Infinity, length)
+  return span && Number.isFinite(span) ? span : undefined
 }
 
 /** The last block of an ffmpeg `-progress` file: key=value lines ending in `progress=…`. */
