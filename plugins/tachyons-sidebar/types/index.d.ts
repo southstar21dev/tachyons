@@ -21,7 +21,7 @@ export type UsageSnap = {
 export type Stats = { tools: number; turns: number; startedAt: number }
 export type CommitRow = { hash: string; subject: string; at: number; added: number; removed: number }
 /** Commits on HEAD that no remote has yet, newest first; `total` counts past the rows kept. */
-export type LocalCommits = { rows: CommitRow[]; total: number }
+export type LocalCommits = { rows: CommitRow[]; total: number; /** Why git could not be read, when it failed. */ error?: string }
 
 declare module 'claude-code' {
   interface PluginState {

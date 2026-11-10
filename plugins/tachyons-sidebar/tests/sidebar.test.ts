@@ -128,12 +128,13 @@ test('the commits section lists what a push would send, then says all is pushed'
   const ahead = text(
     commitsSection({ total: 7, rows: [{ hash: 'abc1234', subject: 'add the thing', at: 0, added: 12, removed: 3 }] }, 32),
   )
-  expect(ahead[1]).toMatch(/^⎇ COMMITS ─+ 7 to push$/)
+  expect(ahead[1]).toMatch(/^↑ COMMITS ─+ 7 to push$/)
   expect(ahead[2]).toMatch(/^abc1234 add the thing +\+12 -3$/)
   expect(ahead[2]!.length).toBe(32)
   expect(ahead[3]).toBe('  … 6 more')
   expect(text(commitsSection({ total: 0, rows: [] }, 32))[2]).toBe('✓ everything pushed')
   expect(commitsSection(null, 32)).toEqual([])
+  expect(text(commitsSection({ total: 0, rows: [], error: 'git: command not found' }, 32))[2]).toBe('✗ git: command not found')
   // A long subject is cut so the counts keep their place.
   const long = text(commitsSection({ total: 1, rows: [{ hash: 'abc1234', subject: 'x'.repeat(80), at: 0, added: 1, removed: 0 }] }, 32))
   expect(long[2]).toMatch(/x… \+1$/)

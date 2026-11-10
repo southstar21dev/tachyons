@@ -277,8 +277,9 @@ function spread(width: number, left: Line, right: Line): Line {
 /** The rows the Commits section takes for what a push would send: none outside a repository. */
 export function commitsSection(git: LocalCommits | null, width: number): Line[] {
   if (!git) return []
-  const lines: Line[] = [[], headingLine(width, '⎇', 'Commits', git.total ? `${git.total} to push` : undefined)]
-  if (git.total === 0) lines.push([span('✓ ', INK.success), span('everything pushed', INK.muted)])
+  const lines: Line[] = [[], headingLine(width, '↑', 'Commits', git.total ? `${git.total} to push` : undefined)]
+  if (git.error) lines.push([span('✗ ', INK.error), span(fit(git.error, width - 2), INK.muted)])
+  else if (git.total === 0) lines.push([span('✓ ', INK.success), span('everything pushed', INK.muted)])
   const shown = git.rows.slice(0, COMMIT_ROWS)
   for (const c of shown) {
     const right = delta(c.added, c.removed)
@@ -349,6 +350,13 @@ async function refreshLimits($: EngineInterface) {
 
 let isReadingGit = false
 
+const firstLine = (text: string) => text.trim().split('\n')[0]?.replace(/^(fatal|error): /, '') ?? ''
+
+/** Writes only when the commits changed, so an idle pane stays still. */
+function setCommits($: EngineInterface, next: LocalCommits | null) {
+  return update($, commits, old => (JSON.stringify(old) === JSON.stringify(next) ? old : next))
+}
+
 /** Reads the commits a push would send; writes only when they changed, so an idle pane stays still. */
 async function refreshCommits($: EngineInterface) {
   if (isReadingGit) return
@@ -360,10 +368,14 @@ async function refreshCommits($: EngineInterface) {
       const total = Number(count.stdout.trim()) || 0
       const log = total ? await $.process.run(['git', 'log', `-n${COMMIT_ROWS * 4}`, ...LOG_ARGS], { timeoutMs: 5000 }) : undefined
       next = { rows: log?.exitCode === 0 ? parseLog(log.stdout) : [], total }
+      if (log && log.exitCode !== 0) next.error = firstLine(log.stderr) || `git log exited ${log.exitCode}`
+    } else if (!/not a git repository/i.test(count.stderr)) {
+      // Outside a repository the section hides; any other refusal is said.
+      next = { rows: [], total: 0, error: firstLine(count.stderr) || `git exited ${count.exitCode}` }
     }
-    await update($, commits, old => (JSON.stringify(old) === JSON.stringify(next) ? old : next))
-  } catch {
-    // git missing or slow: keep what was shown.
+    await setCommits($, next)
+  } catch (err) {
+    await setCommits($, { rows: [], total: 0, error: err instanceof Error ? err.message : String(err) }).catch(() => {})
   } finally {
     isReadingGit = false
   }
@@ -560,7 +572,7 @@ export const register: Register = on => {
     const totalAdded = fileList.reduce((n, f) => n + (f.added ?? 0), 0)
     const totalRemoved = fileList.reduce((n, f) => n + (f.removed ?? 0), 0)
     const commitLines = commitsSection(git, width)
-    const fixedRows = CRAB_ROWS + 16 + (u?.limits.length ?? 0) * 2 + 1 + commitLines.length + (cache ? 4 : 0) + (isVisualizing ? 4 : 0)
+    const fixedRows = CRAB_ROWS + 17 + (u?.limits.length ?? 0) * 2 + 1 + commitLines.length + (cache ? 4 : 0) + (isVisualizing ? 4 : 0)
     const spare = Math.max(2, bodyRows - fixedRows)
     const agentRoom = Math.min(agentList.length, Math.max(1, Math.floor(spare / 2)))
     const fileRoom = Math.max(1, spare - agentRoom)
