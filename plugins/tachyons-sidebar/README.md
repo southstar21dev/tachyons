@@ -3,7 +3,7 @@
 A small pane docked on the right of the terminal:
 
 - **Context**: tokens used out of the window, as a meter
-- **Limits**: 5-hour, 7-day and spend limits with reset times, plus session cost
+- **Limits**: 5-hour, 7-day, per-model weekly (Fable, Opus, Sonnet) and spend limits with reset times, plus session cost. They are refreshed in the background every minute (and after each turn) from the account's usage endpoint, so they move between turns too; if the endpoint can't be reached the meters fall back to what the last reply reported
 - **Cache**: keep-alive state, when [tachyons-cache](../tachyons-cache) is installed
 - **Visualize**: port, current screen and clicks while a [tachyons-visualize](../tachyons-visualize) server runs
 - **Files**: files written or edited this session

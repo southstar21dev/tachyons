@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer, SessionContextUsage, SessionCost, SessionRateLimit } from 'claude-code'
 
-import type { AgentRow, FileChange, UsageSnap } from '../types'
+import type { AgentRow, FileChange, LimitRow, UsageSnap } from '../types'
 import { CRAB_ROWS, OUTFITS, activityOf, crabCells, toBase64 } from './crab'
 import type { CrabFrame } from './crab'
 import { INK, cellsOf, hex, paintCentered, paintPixels, span, widthOf } from './canvas'
@@ -15,6 +15,62 @@ const LOGO_ROWS = LOGO_24.length / 2 + 2
 const WIDTH = 34
 const EDIT_TOOLS = new Set(['Edit', 'MultiEdit', 'Write', 'NotebookEdit'])
 const LIMIT_NAMES: Record<string, string> = { five_hour: '5-hour', seven_day: '7-day', spend_limit: 'spend' }
+const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
+const POLL_MS = 60_000
+
+/** `seven_day_fable` reads `7d fable`; kinds without a name of their own are spelled out. */
+export function limitLabel(kind: string): string {
+  const known = LIMIT_NAMES[kind]
+  if (known) return known
+  const weekly = /^seven_day_(.+)$/.exec(kind)
+  return weekly ? `7d ${weekly[1]!.replace(/_/g, ' ')}` : kind.replace(/_/g, ' ')
+}
+
+/** Every `{ utilization, resets_at }` window in the usage endpoint's answer, the 5-hour and 7-day first. */
+export function parseUsage(body: string): LimitRow[] {
+  let data: unknown
+  try {
+    data = JSON.parse(body)
+  } catch {
+    return []
+  }
+  if (typeof data !== 'object' || data === null) return []
+  const rows: LimitRow[] = []
+  for (const [kind, v] of Object.entries(data)) {
+    if (typeof v !== 'object' || v === null) continue
+    const { utilization, resets_at } = v as { utilization?: unknown; resets_at?: unknown }
+    if (typeof utilization !== 'number') continue
+    rows.push({
+      kind,
+      percentUsed: Math.round(utilization * 10) / 10,
+      ...(typeof resets_at === 'string' ? { resetsAt: resets_at } : {}),
+    })
+  }
+  // Model-scoped weekly windows (Fable, ...) are only in the `limits` list.
+  const list = (data as { limits?: unknown }).limits
+  for (const item of Array.isArray(list) ? list : []) {
+    const { kind, percent, resets_at, scope } = (item ?? {}) as {
+      kind?: unknown
+      percent?: unknown
+      resets_at?: unknown
+      scope?: { model?: { display_name?: unknown } | null } | null
+    }
+    const model = scope?.model?.display_name
+    if (kind !== 'weekly_scoped' || typeof percent !== 'number' || typeof model !== 'string') continue
+    const key = `seven_day_${model.toLowerCase().replace(/\s+/g, '_')}`
+    if (rows.some(r => r.kind === key)) continue
+    rows.push({ kind: key, percentUsed: percent, ...(typeof resets_at === 'string' ? { resetsAt: resets_at } : {}) })
+  }
+  const rank = (k: string) => (k === 'five_hour' ? 0 : k === 'seven_day' ? 1 : 2)
+  return rows.sort((a, b) => rank(a.kind) - rank(b.kind))
+}
+
+/** The polled windows laid over the ones the last reply reported. */
+export function mergeLimits(reported: LimitRow[], polled: LimitRow[]): LimitRow[] {
+  const byKind = new Map(reported.map(l => [l.kind, l]))
+  for (const l of polled) byKind.set(l.kind, l)
+  return [...byKind.values()]
+}
 
 const files = atom({ plugin: 'tachyons-sidebar', key: 'files' } as const, [])
 const agents = atom({ plugin: 'tachyons-sidebar', key: 'agents' } as const, [])
@@ -130,6 +186,40 @@ const crab = {
   timer: undefined as Timer | undefined,
 }
 let hasActiveAgents = false
+// The windows the usage endpoint last reported: they outlive a turn's own reading.
+const poll = { limits: [] as LimitRow[], at: 0, failures: 0, ticks: 0, isBusy: false }
+
+/** Asks the usage endpoint for every window, so the meters move between turns. */
+async function refreshLimits($: EngineInterface) {
+  if (poll.isBusy) return
+  poll.isBusy = true
+  try {
+    const auth = await $.session.authorize()
+    if (!auth) return
+    const res = await $.http.fetch(USAGE_URL, {
+      headers: { 'anthropic-beta': 'oauth-2025-04-20', accept: 'application/json' },
+      auth: auth.handle,
+    })
+    const rows = res.ok ? parseUsage(res.text) : []
+    if (rows.length === 0) {
+      poll.failures++
+      return
+    }
+    poll.failures = 0
+    poll.limits = rows
+    poll.at = Date.now()
+    await update($, usage, u => ({
+      contextWindow: 0,
+      ...u,
+      limits: mergeLimits(u?.limits ?? [], rows),
+      polledAt: poll.at,
+    }))
+  } catch {
+    poll.failures++
+  } finally {
+    poll.isBusy = false
+  }
+}
 
 function crabFrame(): CrabFrame {
   const activity = activityOf(crab.isWorking, crab.mode, crab.tool)
@@ -195,11 +285,17 @@ export const register: Register = on => {
 
     const now = await $.session.usage()
     await update($, usage, () => snapOf(now.context, now.rateLimits, now.cost))
+    void refreshLimits($)
     await update($, stats, s => (s.startedAt ? s : { ...s, startedAt: now.startedAt }))
 
     // Agents are polled only while something could change them.
     $.clock.every(5000, () => {
       if (crab.isWorking || hasActiveAgents) void syncAgents($)
+    })
+    // Limits are polled in the background, backing off while the endpoint refuses.
+    $.clock.every(POLL_MS, () => {
+      poll.ticks++
+      if (poll.ticks % (1 << Math.min(poll.failures, 4)) === 0) void refreshLimits($)
     })
     void $.ui.open({ id: PANE, title: TITLE, columns: WIDTH })
 
@@ -217,7 +313,10 @@ export const register: Register = on => {
   })
 
   on('session.measure', async ($, e, next) => {
-    await update($, usage, () => snapOf(e.context, e.rateLimits, e.cost))
+    await update($, usage, u => {
+      const snap = snapOf(e.context, e.rateLimits, e.cost)
+      return { ...snap, limits: mergeLimits(snap.limits, poll.limits), polledAt: u?.polledAt }
+    })
     return next(e)
   })
 
@@ -233,6 +332,7 @@ export const register: Register = on => {
     if (!e.agentId) {
       sleep($)
       void syncAgents($)
+      void refreshLimits($)
     }
     return next(e)
   })
@@ -300,7 +400,7 @@ export const register: Register = on => {
       u?.contextPercent ?? (u?.contextTokens && u.contextWindow ? (u.contextTokens / u.contextWindow) * 100 : undefined)
     const active = agentList.filter(a => a.status === 'running' || a.status === 'pending' || a.status === 'waiting').length
     const totalEdits = fileList.reduce((n, f) => n + f.edits, 0)
-    const fixedRows = CRAB_ROWS + 16 + (u?.limits.length ?? 0) * 2 + LOGO_ROWS + (cache ? 4 : 0) + (isVisualizing ? 4 : 0)
+    const fixedRows = CRAB_ROWS + 16 + (u?.limits.length ?? 0) * 2 + 1 + LOGO_ROWS + (cache ? 4 : 0) + (isVisualizing ? 4 : 0)
     const spare = Math.max(2, bodyRows - fixedRows)
     const agentRoom = Math.min(agentList.length, Math.max(1, Math.floor(spare / 2)))
     const fileRoom = Math.max(1, spare - agentRoom)
@@ -342,8 +442,9 @@ export const register: Register = on => {
     blank()
     heading('◷', 'Limits')
     if (!u || u.limits.length === 0) lines.push([span('waiting for the first reply', INK.muted)])
+    const labelWidth = Math.min(10, Math.max(7, ...(u?.limits ?? []).map(l => limitLabel(l.kind).length + 1)))
     for (const l of u?.limits ?? []) {
-      const label = (LIMIT_NAMES[l.kind] ?? l.kind).padEnd(7)
+      const label = fit(limitLabel(l.kind), labelWidth - 1).padEnd(labelWidth)
       const pctText = `${Math.round(l.percentUsed)}%`.padStart(5)
       lines.push([
         span(label, INK.muted),
@@ -352,6 +453,7 @@ export const register: Register = on => {
       ])
       if (l.resetsAt) lines.push([span(' '.repeat(label.length)), span('↻ ', INK.faint), span(resetLabel(l.resetsAt), INK.faint)])
     }
+    if (u?.polledAt) lines.push([span(`refreshed ${clockTime(u.polledAt)}`, INK.faint)])
     if (u?.costUsd !== undefined) lines.push([span(`$${u.costUsd.toFixed(2)}`), span(' spent this session', INK.muted)])
 
     if (cache) {

@@ -5,7 +5,7 @@ import { cellsOf, paintPixels, span } from '../hooks/canvas'
 import { LOGO_32, LOGO_COLORS } from '../hooks/logo'
 import { CRAB_ROWS, OUTFITS, activityOf, crabCells, spriteRows, toBase64 } from '../hooks/crab'
 import type { CrabActivity } from '../hooks/crab'
-import { heat, meter, shortPath } from '../hooks/register'
+import { heat, limitLabel, mergeLimits, meter, parseUsage, shortPath } from '../hooks/register'
 
 const PANE_PROPS = {
   title: 'Session',
@@ -24,6 +24,38 @@ test('bar and paths format', async () => {
   expect(heat(1)).toBe(0xe5484d)
   expect(shortPath('/repo/src/a.ts', '/repo')).toBe('src/a.ts')
   expect(shortPath('/x/y/z/a.ts', '/repo')).toBe('…/z/a.ts')
+})
+
+test('usage endpoint windows become limit rows, fable included', async () => {
+  const body = JSON.stringify({
+    seven_day_fable: { utilization: 12.34, resets_at: '2026-11-12T00:00:00Z' },
+    seven_day: { utilization: 40, resets_at: null },
+    five_hour: { utilization: 7, resets_at: '2026-11-10T20:00:00Z' },
+    seven_day_opus: null,
+    extra_usage: { is_enabled: false },
+  })
+  const rows = parseUsage(body)
+  expect(rows.map(r => r.kind)).toEqual(['five_hour', 'seven_day', 'seven_day_fable'])
+  expect(rows[2]).toEqual({ kind: 'seven_day_fable', percentUsed: 12.3, resetsAt: '2026-11-12T00:00:00Z' })
+  const scoped = parseUsage(
+    JSON.stringify({
+      five_hour: { utilization: 94, resets_at: null },
+      limits: [
+        { kind: 'session', percent: 94 },
+        { kind: 'weekly_scoped', percent: 37, resets_at: '2026-11-10T22:59:59Z', scope: { model: { id: null, display_name: 'Fable' } } },
+      ],
+    }),
+  )
+  expect(scoped).toEqual([
+    { kind: 'five_hour', percentUsed: 94 },
+    { kind: 'seven_day_fable', percentUsed: 37, resetsAt: '2026-11-10T22:59:59Z' },
+  ])
+  expect(parseUsage('nope')).toEqual([])
+  expect(limitLabel('seven_day_fable')).toBe('7d fable')
+  expect(limitLabel('five_hour')).toBe('5-hour')
+  expect(mergeLimits([{ kind: 'five_hour', percentUsed: 1 }, { kind: 'spend_limit', percentUsed: 3 }], rows).map(r => [r.kind, r.percentUsed])).toEqual([
+    ['five_hour', 7], ['spend_limit', 3], ['seven_day', 40], ['seven_day_fable', 12.3],
+  ])
 })
 
 test('sidebar shows edited files and usage', async ($, on) => {

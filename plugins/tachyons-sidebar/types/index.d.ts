@@ -7,6 +7,8 @@ export type UsageSnap = {
   contextPercent?: number
   limits: LimitRow[]
   costUsd?: number
+  /** When the usage endpoint last answered, so the Limits section can say how fresh it is. */
+  polledAt?: number
 }
 export type Stats = { tools: number; turns: number; startedAt: number }
 
