@@ -1,7 +1,11 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { AgentProgress, CiProgress, CommandProgress, PlanProgress, PlanStatus, PlanTask } from '../types'
+import type { AgentProgress, CommandProgress, DeviceProgress, EmulatorProgress, PhoneProgress, PlanProgress, PlanStatus, PlanTask } from '../types'
+import { adbCallsOf, DEVICE_INFO_SCRIPT, deviceInfoOf, deviceLabelOf, nextDevice, nextPhones, parseAdbDevices } from './adb'
+import type { AdbCall } from './adb'
+import { androidBootOf, androidEmulatorsOf, memory, mergeEmulators, parsePs, parseSimctl, simulatorProcsOf } from './emulators'
+import type { Simulator } from './emulators'
 import {
   ciRunIdOf,
   ffmpegInputOf,
@@ -30,6 +34,10 @@ const ACTIVE = new Set(['pending', 'running', 'waiting'])
 const agents = atom({ plugin: 'tachyons-progress', key: 'agents' } as const, [])
 const commands = atom({ plugin: 'tachyons-progress', key: 'commands' } as const, [])
 const plan = atom({ plugin: 'tachyons-progress', key: 'plan' } as const, null)
+const emulators = atom({ plugin: 'tachyons-progress', key: 'emulators' } as const, [])
+const phones = atom({ plugin: 'tachyons-progress', key: 'phones' } as const, [])
+// A phone that dropped off stays on the band this long, saying for how long it has been gone.
+const PHONE_GONE_KEEP_MS = 10 * 60_000
 const isHidden = atom({ plugin: 'tachyons-progress', key: 'isHidden' } as const, false)
 const now = atom({ plugin: 'tachyons-progress', key: 'now' } as const, 0)
 
@@ -49,6 +57,8 @@ export type Row = {
   accent?: string
   /** The row has ended: it is drawn quieter, its meter full. */
   isDone?: boolean
+  /** Nothing to measure (a device that is simply on): the meter's cells stay empty. */
+  hasNoMeter?: boolean
 }
 
 const SPINNER = ['◜', '◠', '◝', '◞', '◡', '◟']
@@ -112,6 +122,119 @@ function leftSpan(estimateMs: number | undefined, elapsed: number): Span {
   if (!estimateMs) return { text: 'first run, no estimate', dim: true }
   const left = estimateMs - elapsed
   return left >= 0 ? { text: `~${duration(left)} left`, dim: true } : { text: `${duration(-left)} over estimate`, color: 'warning' }
+}
+
+// adb's words for a device on its way back; any other (recovery, sideload) is shown as adb says it.
+const RECONNECTING = new Set(['offline', 'connecting', 'authorizing'])
+
+/** Where an adb command's device stands: `● connected`, `◌ reconnecting 12s`, `✗ disconnected 1m 05s`. */
+export function deviceSpans(d: DeviceProgress | undefined, at: number): Span[] {
+  if (!d) return [{ text: '… looking for the device', dim: true }]
+  if (d.error) return [{ text: `? ${d.error}`, color: 'warning' }]
+  const lasted = ` ${duration(at - d.since)}`
+  switch (d.state) {
+    case 'connected':
+      return d.drops
+        ? [{ text: '● connected', color: 'success' }, { text: ` · reconnected ${d.drops}×`, dim: true }]
+        : [{ text: '● connected', color: 'success' }]
+    case 'reconnecting': {
+      const word = d.adbState && !RECONNECTING.has(d.adbState) ? d.adbState : 'reconnecting'
+      return [{ text: `◌ ${word}${lasted}`, color: 'warning' }]
+    }
+    case 'unauthorized':
+      return [{ text: '! unauthorized, allow debugging on the phone', color: 'warning' }]
+    case 'disconnected':
+      return [{ text: `✗ disconnected${lasted}`, color: 'error' }]
+    case 'searching':
+      return [{ text: `… no device yet${lasted}`, color: 'warning' }]
+    default:
+      return [{ text: '? device unknown', color: 'warning' }]
+  }
+}
+
+/** The worst of several devices' states, for the spinner's color. */
+function devicesColor(devices: DeviceProgress[] | undefined, fallback: string | undefined): string | undefined {
+  const states = (devices ?? []).map(d => (d.error ? 'unknown' : d.state))
+  if (states.includes('disconnected')) return 'error'
+  if (states.some(s => s !== 'connected')) return 'warning'
+  return fallback
+}
+
+/** One line for the devices of an adb row: each device's state, in the order the detail names them. */
+function devicesSpans(devices: DeviceProgress[] | undefined, at: number): Span[] {
+  if (!devices?.length) return deviceSpans(undefined, at)
+  if (devices.length === 1) return deviceSpans(devices[0], at)
+  return devices.flatMap((d, i) => [...(i ? [{ text: '  ' }] : []), ...deviceSpans(d, at).slice(0, 1)])
+}
+
+/** The devices' names, joined: `Pixel 8 Pro · wifi`, or `S26 Ultra + S23 Ultra` for several. */
+function devicesLabel(devices: DeviceProgress[] | undefined): string | undefined {
+  if (!devices?.length) return undefined
+  if (devices.length === 1) return deviceLabelOf(devices[0]!)
+  return devices.map(d => (d.name ?? d.model?.replace(/_/g, ' ') ?? d.serial ?? '?')).join(' + ')
+}
+
+/** A running emulator or simulator: what it is, its OS, how long it has been up and, for Android, its memory. */
+export function emulatorRow(e: EmulatorProgress, at: number): Row {
+  const dot: Span = { text: ' · ', dim: true }
+  const name = e.platform === 'android' ? 'emulator' : 'simulator'
+  const up = duration((e.endedAt ?? at) - e.startedAt)
+  if (e.endedAt) {
+    return {
+      glyph: { text: '○', color: 'subtle' },
+      name,
+      detail: e.name,
+      accent: 'permission',
+      isDone: true,
+      hasNoMeter: true,
+      stat: { text: 'off', dim: true },
+      info: [{ text: `stopped after ${up}` }],
+    }
+  }
+  const info: Span[] = []
+  if (e.state === 'booting') info.push({ text: `booting ${up}`, color: 'warning' }, dot)
+  if (e.state === 'shutting-down') info.push({ text: 'shutting down', color: 'warning' }, dot)
+  if (e.os) info.push({ text: e.os }, dot)
+  if (e.platform === 'android') info.push({ text: e.serial, dim: true }, dot)
+  info.push({ text: `up ${up}`, dim: true })
+  if (e.rssKb) info.push(dot, { text: memory(e.rssKb), dim: true })
+  const isOn = e.state === 'booted' || e.state === 'running'
+  return {
+    glyph: isOn
+      ? { text: '●', color: 'success' }
+      : e.state === 'booting'
+        ? { text: SPINNER[Math.floor(at / 1000) % SPINNER.length]!, color: 'warning' }
+        : { text: '◌', color: 'warning' },
+    name,
+    detail: e.name,
+    accent: 'permission',
+    hasNoMeter: e.state !== 'booting',
+    stat: isOn ? { text: 'on', color: 'success' } : { text: '…', dim: true },
+    info,
+  }
+}
+
+/** A phone adb lists: its name, whether it is there, its Android version and how it is reached. */
+export function phoneRow(p: PhoneProgress, at: number): Row {
+  const dot: Span = { text: ' · ', dim: true }
+  const state = p.error ? 'unknown' : p.state
+  const info: Span[] = [...deviceSpans(p, at)]
+  if (p.os) info.push(dot, { text: p.os })
+  if (p.serial) info.push(dot, { text: p.transport === 'usb' ? `usb ${p.serial}` : p.serial, dim: true })
+  return {
+    glyph:
+      state === 'connected'
+        ? { text: '●', color: 'success' }
+        : state === 'disconnected'
+          ? { text: '✗', color: 'error' }
+          : { text: SPINNER[Math.floor(at / 1000) % SPINNER.length]!, color: 'warning' },
+    name: 'phone',
+    detail: p.name ?? p.model?.replace(/_/g, ' ') ?? p.serial ?? 'phone',
+    accent: 'permission',
+    hasNoMeter: true,
+    stat: state === 'connected' ? { text: 'on', color: 'success' } : state === 'disconnected' ? { text: 'off', color: 'error' } : { text: '…', dim: true },
+    info,
+  }
 }
 
 /** The plan's row: a meter of tasks done, the task under way, and a glyph for every task. */
@@ -194,15 +317,20 @@ export function rowsOf(agentRows: AgentProgress[], commandRows: CommandProgress[
     const background: Span[] = c.isBackground && !c.endedAt ? [dot, { text: 'background', dim: true }] : []
     const accent = c.kind === 'ci' ? 'suggestion' : c.kind === 'render' ? 'merged' : undefined
 
+    const devices = c.kind === 'adb' ? c.devices : undefined
+    const deviceLabel = devicesLabel(devices)
+
     if (c.endedAt) {
+      // An adb command that ended away from its device says so: the phone may be why it ended.
+      const lost = devices?.some(d => d.state !== 'connected') ? [dot, ...devicesSpans(devices, c.endedAt)] : []
       rows.push({
         glyph,
         name: c.label,
-        detail: c.kind === 'ci' ? 'CI' : c.kind === 'render' ? 'render' : c.command,
+        detail: c.kind === 'ci' ? 'CI' : c.kind === 'render' ? 'render' : (deviceLabel ?? c.command),
         accent,
         isDone: true,
         stat: c.isError ? { text: 'failed', color: 'error' } : c.isLost ? { text: 'ended', dim: true } : { text: 'done', color: 'success' },
-        info: [{ text: duration(elapsed) }],
+        info: [{ text: duration(elapsed) }, ...lost],
       })
       continue
     }
@@ -248,6 +376,16 @@ export function rowsOf(agentRows: AgentProgress[], commandRows: CommandProgress[
         stat: fraction === undefined ? { text: '…', dim: true } : { text: `${Math.round(fraction * 100)}%`, bold: true },
         info,
       })
+    } else if (c.kind === 'adb') {
+      // A device row runs as long as it is wanted (logcat, a shell): no estimate, only where the phone is.
+      // The spinner takes the devices' color: amber while one is away, red once one is gone.
+      rows.push({
+        glyph: { ...glyph, color: devicesColor(devices, glyph.color) },
+        name: c.label,
+        detail: deviceLabel ?? c.command,
+        stat: { text: '', dim: true },
+        info: [...devicesSpans(devices, at), dot, { text: duration(elapsed), bold: true }, ...background],
+      })
     } else {
       rows.push({
         glyph,
@@ -270,6 +408,7 @@ let seq = 0
 let ticks = 0
 let isTurnRunning = false
 let ticker: Timer | undefined
+let emulatorTicker: Timer | undefined
 const pollers = new Map<string, Timer>()
 
 const estimateFor = (label: string) => median(history[label] ?? [])
@@ -474,6 +613,238 @@ function pollRender($: EngineInterface, id: string, command: string, file: strin
   pollers.set(id, $.clock.every(1000, () => void tick()))
 }
 
+// The adb that answered for a binary as written, so the next look skips the ones that did not.
+const adbFound = new Map<string, string>()
+const ADB_POLL_MS = 3000
+
+/**
+ * The adb binaries to try for one written on a line, the written one first: a different
+ * adb version would restart the server and drop every wireless connection, so a fallback
+ * is only tried when the written one cannot start at all.
+ */
+async function adbBinaries($: EngineInterface, written: string): Promise<string[]> {
+  const home = (await $.env.get('HOME').catch(() => undefined)) || undefined
+  const sdk =
+    (await $.env.get('ANDROID_HOME').catch(() => undefined)) || (await $.env.get('ANDROID_SDK_ROOT').catch(() => undefined)) || undefined
+  const vars: Record<string, string | undefined> = { HOME: home, ANDROID_HOME: sdk, ANDROID_SDK_ROOT: sdk }
+  const expanded = written
+    .replace(/^~(?=\/)/, home ?? '~')
+    .replace(/\$\{?(HOME|ANDROID_HOME|ANDROID_SDK_ROOT)\}?/g, (_, name: string) => vars[name] ?? '$')
+  const list = [
+    adbFound.get(written),
+    expanded.includes('$') || expanded.startsWith('~') ? undefined : expanded,
+    'adb',
+    sdk && `${sdk}/platform-tools/adb`,
+    home && `${home}/Library/Android/sdk/platform-tools/adb`,
+    home && `${home}/Android/Sdk/platform-tools/adb`,
+  ]
+  return [...new Set(list.filter((x): x is string => !!x))]
+}
+
+/** Runs adb against the same server the command uses; rejects when no adb can start. */
+async function runAdb($: EngineInterface, call: AdbCall, args: string[], timeoutMs: number) {
+  for (const bin of await adbBinaries($, call.bin)) {
+    const ran = await $.process.run([bin, ...call.server, ...args], { ...(cwd ? { cwd } : {}), timeoutMs }).catch(() => undefined)
+    if (!ran) continue
+    adbFound.set(call.bin, bin)
+    return ran
+  }
+  throw new Error('adb not found')
+}
+
+// Each serial's name and Android version, asked once and shared by command and phone rows.
+const deviceInfos = new Map<string, Promise<{ name?: string; os?: string }>>()
+
+/** The phone's own name and Android version, asked once per serial (again after a failed ask). */
+function deviceInfo($: EngineInterface, call: AdbCall, serial: string, model: string | undefined): Promise<{ name?: string; os?: string }> {
+  const known = deviceInfos.get(serial)
+  if (known) return known
+  const asked = runAdb($, call, ['-s', serial, 'shell', DEVICE_INFO_SCRIPT], 8000)
+    .then(ran => (ran.exitCode === 0 ? deviceInfoOf(ran.stdout, model) : {}))
+    .catch(() => ({}))
+    .then(info => {
+      if (!info.name) deviceInfos.delete(serial)
+      return info
+    })
+  deviceInfos.set(serial, asked)
+  return asked
+}
+
+async function nameDevice($: EngineInterface, call: AdbCall, serial: string, model: string | undefined): Promise<string | undefined> {
+  return (await deviceInfo($, call, serial, model)).name
+}
+
+/** Asks `adb devices -l` every few seconds which phones the command talks to and whether they are still there. */
+function pollAdb($: EngineInterface, id: string, command: string) {
+  const written = adbCallsOf(command)
+  if (written.length === 0) return
+  let isBusy = false
+  const named = new Set<string>()
+  const tick = async () => {
+    if (isBusy) return
+    isBusy = true
+    try {
+      // A line that names no device may still have one picked by ANDROID_SERIAL in the environment.
+      const envSerial = (await $.env.get('ANDROID_SERIAL').catch(() => undefined)) || undefined
+      const calls = written.map(w => (envSerial && !w.serial && !w.only && !w.transportId ? { ...w, serial: envSerial } : w))
+      const ran = await runAdb($, calls[0]!, ['devices', '-l'], 10_000)
+      if (ran.exitCode !== 0) throw new Error(ran.stderr.trim().split('\n')[0] || `adb exited ${ran.exitCode}`)
+      const listed = parseAdbDevices(ran.stdout)
+      const at = Date.now()
+      const row = (await read($, commands)).find(c => c.id === id)
+      if (!row || row.endedAt) return
+      const devices = calls.map((call, i) => nextDevice(row.devices?.[i], listed, call, at))
+      if (JSON.stringify(devices) !== JSON.stringify(row.devices)) await patchCommand($, id, c => ({ ...c, devices }))
+      for (const [i, device] of devices.entries()) {
+        const serial = device.serial
+        if (device.state !== 'connected' || !serial || device.name || named.has(serial)) continue
+        named.add(serial)
+        const name = await nameDevice($, calls[i]!, serial, device.model)
+        if (name) {
+          await patchCommand($, id, c => ({
+            ...c,
+            devices: c.devices?.map(d => (d.serial === serial ? { ...d, name } : d)),
+          }))
+        }
+      }
+    } catch (err) {
+      const error = fit(String((err as Error).message ?? err), 40)
+      await patchCommand($, id, c => ({
+        ...c,
+        devices: (c.devices?.length ? c.devices : [{ state: 'unknown' as const, since: Date.now(), drops: 0 }]).map(d => ({ ...d, error })),
+      }))
+    } finally {
+      isBusy = false
+    }
+  }
+  pollers.set(id, $.clock.every(ADB_POLL_MS, () => void tick()))
+  void tick()
+}
+
+// What adb said of each emulator process, so a booted one is not asked again.
+const androidBoot = new Map<number, { state: 'booting' | 'booted' | 'running'; os?: string }>()
+let simCache: { key: string; sims: Simulator[] } | undefined
+let isPollingEmulators = false
+const EMULATOR_POLL_MS = 5000
+
+/**
+ * Looks for running emulators and simulators. `ps` comes first and is all it runs while
+ * there are none: adb is asked only about an emulator still booting, and `simctl` only
+ * when the set of booted simulators changed or one of them is still booting.
+ */
+async function pollEmulators($: EngineInterface) {
+  if (isPollingEmulators) return
+  isPollingEmulators = true
+  try {
+    if (await read($, isHidden)) return
+    const ps = await $.process.run(['ps', '-axo', 'pid=,etime=,rss=,command='], { timeoutMs: 5000 }).catch(() => undefined)
+    if (!ps || ps.exitCode !== 0) return
+    const procs = parsePs(ps.stdout)
+    const old = new Map((await read($, emulators)).map(e => [e.id, e]))
+    const at = Date.now()
+    const seen: EmulatorProgress[] = []
+
+    const android = androidEmulatorsOf(procs)
+    for (const pid of androidBoot.keys()) if (!android.some(e => e.pid === pid)) androidBoot.delete(pid)
+    for (const emu of android) {
+      let boot = androidBoot.get(emu.pid)
+      if (!boot || boot.state === 'booting') {
+        const script = 'getprop sys.boot_completed; getprop ro.build.version.release; getprop ro.build.version.sdk'
+        const ran = await runAdb($, { bin: emu.adb ?? 'adb', sub: 'shell', server: [] }, ['-s', emu.serial, 'shell', script], 5000).catch(() => null)
+        // No adb at all: it runs, but whether it has booted is not known.
+        if (ran === null) boot = { state: 'running' }
+        else if (ran.exitCode !== 0) boot = { state: 'booting' }
+        else {
+          const parsed = androidBootOf(ran.stdout)
+          boot = { state: parsed.isBooted ? 'booted' : 'booting', ...(parsed.os ? { os: parsed.os } : {}) }
+        }
+        androidBoot.set(emu.pid, boot)
+      }
+      seen.push({
+        id: `android:${emu.pid}`,
+        platform: 'android',
+        name: emu.avd.replace(/_/g, ' '),
+        serial: emu.serial,
+        state: boot.state,
+        ...(boot.os ? { os: boot.os } : {}),
+        startedAt: at - emu.upMs,
+        rssKb: emu.rssKb,
+      })
+    }
+
+    const simProcs = simulatorProcsOf(procs)
+    if (simProcs.length === 0) simCache = undefined
+    else {
+      const key = simProcs.map(p => p.pid).sort((a, b) => a - b).join(',')
+      if (!simCache || simCache.key !== key || simCache.sims.some(s => s.state !== 'Booted')) {
+        const ran = await $.process.run(['xcrun', 'simctl', 'list', 'devices', '-j'], { timeoutMs: 15_000 }).catch(() => undefined)
+        try {
+          if (ran?.exitCode === 0) simCache = { key, sims: parseSimctl(ran.stdout) }
+        } catch {
+          // Output simctl could not be read as JSON: keep what the last look saw.
+        }
+      }
+      // Each simulator's launchd names its device folder: how long that process has run is its uptime.
+      const upOf = new Map(simProcs.flatMap(p => {
+        const udid = /\/Devices\/([0-9A-Fa-f-]{36})\//.exec(p.command)?.[1]
+        return udid ? [[udid.toUpperCase(), p.upMs] as const] : []
+      }))
+      for (const sim of simCache?.sims ?? []) {
+        const id = `ios:${sim.udid}`
+        const upMs = upOf.get(sim.udid.toUpperCase())
+        seen.push({
+          id,
+          platform: 'ios',
+          name: sim.name,
+          serial: sim.udid,
+          state: sim.state === 'Booted' ? 'booted' : sim.state === 'Booting' ? 'booting' : 'shutting-down',
+          ...(sim.os ? { os: sim.os } : {}),
+          startedAt: upMs !== undefined ? at - upMs : (old.get(id)?.startedAt ?? at),
+        })
+      }
+    }
+
+    const list = await read($, emulators)
+    const next = mergeEmulators(list, seen, at)
+    if (JSON.stringify(next) !== JSON.stringify(list)) await update($, emulators, () => next)
+
+    await pollPhones($, procs, android[0]?.adb)
+  } finally {
+    isPollingEmulators = false
+  }
+}
+
+/**
+ * Looks at the phones adb lists, only while an adb server runs (asking with none would start one).
+ * The SDK's adb comes first; any other is used only when that one cannot start.
+ */
+async function pollPhones($: EngineInterface, procs: { command: string }[], sdkAdb: string | undefined) {
+  const hasServer = procs.some(p => /(?:^|\/)adb(?:\s.*)?\sserver(?:\s|$)/.test(p.command))
+  const old = await read($, phones)
+  const at = Date.now()
+  let next: PhoneProgress[]
+  const call: AdbCall = { bin: sdkAdb ?? [...adbFound.values()][0] ?? '~/Library/Android/sdk/platform-tools/adb', sub: 'devices', server: [] }
+  if (!hasServer) next = nextPhones(old, [], at)
+  else {
+    const ran = await runAdb($, call, ['devices', '-l'], 10_000).catch(() => undefined)
+    if (!ran || ran.exitCode !== 0) return
+    next = nextPhones(old, parseAdbDevices(ran.stdout), at)
+  }
+  // Gone long enough: off the band. A phone never connected (unauthorized, then unplugged) goes too.
+  next = next.filter(p => p.state !== 'disconnected' || at - p.since < PHONE_GONE_KEEP_MS)
+  const prior = new Map(old.map(p => [p.id, p]))
+  next = next.map(p => ({ ...p, ...(prior.get(p.id)?.os && !p.os ? { os: prior.get(p.id)!.os } : {}) }))
+  if (JSON.stringify(next) !== JSON.stringify(old)) await update($, phones, () => next)
+  for (const p of next) {
+    if (p.state !== 'connected' || !p.serial || (p.name && p.os)) continue
+    const serial = p.serial
+    void deviceInfo($, call, serial, p.model).then(async info => {
+      if (!info.name && !info.os) return
+      await update($, phones, list => list.map(x => (x.serial === serial ? { ...x, ...info } : x)))
+    })
+  }
+}
+
 /** Folds one task tool call into the plan: TodoWrite writes it whole, the Task tools a task at a time. */
 async function notePlan($: EngineInterface, tool: string, input: Record<string, unknown>, result: unknown) {
   const at = Date.now()
@@ -536,8 +907,21 @@ async function tickBand($: EngineInterface) {
   if (c.some(x => stale(x.endedAt))) await update($, commands, list => list.filter(x => !stale(x.endedAt)))
   const p = await read($, plan)
   if (p && stale(p.endedAt)) await update($, plan, () => null)
+  const em = await read($, emulators)
+  const ph = await read($, phones)
+  if (em.some(x => stale(x.endedAt))) await update($, emulators, list => list.filter(x => !stale(x.endedAt)))
+  // An adb row outlives a reload in state, its poller does not: start it again. A row
+  // from before adb rows existed is known by its line.
+  for (const x of c) {
+    if (x.endedAt || pollers.has(x.id)) continue
+    const line = x.runCommand ?? x.command
+    if (x.kind === 'adb' || (x.kind === 'shell' && kindOf(line) === 'adb')) {
+      if (x.kind !== 'adb') await patchCommand($, x.id, row => ({ ...row, kind: 'adb' }))
+      pollAdb($, x.id, line)
+    }
+  }
   if (ticks % 3 === 0 && (isTurnRunning || a.some(x => !x.endedAt))) await syncAgents($)
-  if (hasLive(a, c) || p || a.some(x => x.endedAt) || c.some(x => x.endedAt)) await update($, now, () => at)
+  if (hasLive(a, c) || p || em.length || ph.length || a.some(x => x.endedAt) || c.some(x => x.endedAt)) await update($, now, () => at)
 }
 
 export const register: Register = on => {
@@ -550,6 +934,9 @@ export const register: Register = on => {
 
     ticker?.cancel()
     ticker = $.clock.every(1000, () => void tickBand($))
+    emulatorTicker?.cancel()
+    emulatorTicker = $.clock.every(EMULATOR_POLL_MS, () => void pollEmulators($).catch(() => {}))
+    void pollEmulators($).catch(() => {})
     return next(e)
   })
 
@@ -663,6 +1050,7 @@ export const register: Register = on => {
     await update($, commands, list => [...list.filter(c => c.id !== id), row].slice(-24))
     if (kind === 'ci') pollCi($, id, command)
     if (kind === 'render' && progressFile) pollRender($, id, command, progressFile)
+    if (kind === 'adb') pollAdb($, id, command)
 
     let ran: Awaited<ReturnType<typeof next>>
     try {
@@ -740,12 +1128,16 @@ export const register: Register = on => {
     const a = await read($, agents)
     const c = await read($, commands)
     const p = await read($, plan)
-    if (a.length === 0 && c.length === 0 && !p) return next(e)
+    const em = await read($, emulators)
+    const ph = await read($, phones)
+    if (a.length === 0 && c.length === 0 && !p && em.length === 0 && ph.length === 0) return next(e)
 
     const order = <T extends { startedAt: number; endedAt?: number }>(rows: T[]) =>
       [...rows].sort((x, y) => Number(!!x.endedAt) - Number(!!y.endedAt) || x.startedAt - y.startedAt)
     const work = rowsOf(order(a), order(c), at)
-    const rows = p ? [planRow(p, at), ...work] : work
+    // Emulators and simulators come last: they are the room the work runs in, not the work.
+    const devices = [...ph.map(x => phoneRow(x, at)), ...order(em).map(x => emulatorRow(x, at))]
+    const rows = [...(p ? [planRow(p, at)] : []), ...work, ...devices]
     const shown = rows.slice(0, MAX_ROWS)
     const running = a.filter(x => !x.endedAt).length + c.filter(x => !x.endedAt).length
     const done = work.length - running
@@ -769,6 +1161,7 @@ export const register: Register = on => {
       ))
     const failed = c.filter(x => x.endedAt && x.isError).length + a.filter(x => x.endedAt && x.status !== 'completed').length
     const meterOf = (row: Row) => {
+      if (row.hasNoMeter) return <Text>{' '.repeat(meterWidth)}</Text>
       if (row.isDone) {
         const color = row.stat.color === 'error' ? 'error' : 'success'
         return <Text color={color} dimColor>{'━'.repeat(meterWidth)}</Text>

@@ -1,7 +1,7 @@
 {
   "name": "tachyons-progress",
-  "version": "0.3.1",
-  "description": "A band above the prompt with live progress of subagents and long commands: elapsed, estimated time left, CI job status and video render progress",
+  "version": "0.4.0",
+  "description": "A band above the prompt with live progress of subagents and long commands: elapsed, estimated time left, CI job status, video render progress and which Android device adb is connected to, and running emulators and simulators",
   "author": {
     "name": "southstar21",
     "url": "https://southstar21.dev"
