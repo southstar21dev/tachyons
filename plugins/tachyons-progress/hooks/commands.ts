@@ -1,4 +1,5 @@
 import type { CiJob, CiProgress, CommandKind, RenderProgress } from '../types'
+import { adbCallOf, adbLabelOf, expandLineVariables } from './adb'
 
 // Tools whose first word says little on its own: the subcommand joins the label.
 const SUBCOMMAND_TOOLS = new Set([
@@ -26,9 +27,11 @@ export function firstCommand(command: string): string {
 
 /** The short name of a command used to remember how long it takes: `npm test`, `gh run watch`. */
 export function labelOf(command: string): string {
-  const words = firstCommand(command).split(/\s+/).filter(Boolean)
+  const words = firstCommand(expandLineVariables(command.replace(/\\\n/g, ' '))).split(/\s+/).filter(Boolean)
   const head = words[0] ?? ''
   const name = head.split('/').pop() ?? head
+  // adb's options come before its subcommand and take values: `adb -s 192.168.0.5:5555 logcat`.
+  if (name === 'adb') return adbLabelOf(words)
   if (!SUBCOMMAND_TOOLS.has(name)) return name || 'command'
   const sub = words.slice(1).filter(w => !w.startsWith('-'))
   const take = THREE_WORD_TOOLS.has(name) ? 2 : 1
@@ -38,6 +41,7 @@ export function labelOf(command: string): string {
 export function kindOf(command: string): CommandKind {
   if (/(^|&&|\|\|?|;|\(|\n)[ \t]*ffmpeg\s/.test(command)) return 'render'
   if (/\bgh\s+(?:run\s+(?:watch|view)|pr\s+checks)\b/.test(command)) return 'ci'
+  if (adbCallOf(command)) return 'adb'
   return 'shell'
 }
 

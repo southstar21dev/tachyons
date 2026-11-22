@@ -1,4 +1,6 @@
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
+
+import { adbCallOf, adbCallsOf, deviceInfoOf, deviceLabelOf, expandLineVariables, nextPhones, deviceNameOf, nextDevice, parseAdbDevices, transportOf } from '../hooks/adb'
 
 import {
   ciRunIdOf,
@@ -15,7 +17,8 @@ import {
   withProgressFile,
 } from '../hooks/commands'
 import { clock, duration, meter, remaining } from '../hooks/format'
-import { blocks, planFromTodos, planRow, rowsOf, sliding } from '../hooks/register'
+import { androidBootOf, androidEmulatorsOf, etimeToMs, memory, mergeEmulators, parsePs, parseSimctl, runtimeName, simulatorProcsOf } from '../hooks/emulators'
+import { blocks, emulatorRow, phoneRow, planFromTodos, planRow, rowsOf, sliding } from '../hooks/register'
 
 // The test environment has a timer; the API types do not name it.
 declare const setTimeout: (fn: () => void, ms: number) => unknown
@@ -398,5 +401,325 @@ test("a subagent's TodoWrite leaves the plan alone", async ($, on) => {
   const band = await bandText($)
   expect(await band.find({ type: 'Text', text: /^plan$/ })).toBeUndefined()
   expect(await band.find({ type: 'Text', text: /engine band/ })).toBeDefined()
+  await band.unmount()
+})
+
+const DEVICES = [
+  'List of devices attached',
+  '192.168.0.110:36007    device product:m3qxxx model:SM_S948B device:m3q transport_id:45',
+  'R5CT1234ABC            unauthorized usb:1-1 transport_id:7',
+  'emulator-5554          offline product:sdk_gphone64_arm64 model:sdk_gphone64_arm64 device:emu64a transport_id:44',
+  '',
+].join('\n')
+
+test('adb lines get a label, a kind and the device they ask for', async () => {
+  expect(labelOf('~/Library/Android/sdk/platform-tools/adb -s 192.168.0.110:36007 logcat -v time')).toBe('adb logcat')
+  expect(labelOf('adb -d shell am start -n x/.Main')).toBe('adb shell')
+  expect(kindOf('~/Library/Android/sdk/platform-tools/adb -s 192.168.0.110:36007 logcat')).toBe('adb')
+  expect(kindOf('adb devices -l')).toBe('shell')
+  expect(kindOf('adb connect 192.168.0.110:36007')).toBe('shell')
+  expect(kindOf('echo "run adb logcat later"')).toBe('shell')
+  expect(kindOf('./gradlew installDebug && adb -s emulator-5554 shell am start -n x/.Main')).toBe('adb')
+
+  expect(adbCallOf('~/Library/Android/sdk/platform-tools/adb -s "192.168.0.110:36007" logcat')).toEqual({
+    bin: '~/Library/Android/sdk/platform-tools/adb', sub: 'logcat', serial: '192.168.0.110:36007', server: [],
+  })
+  expect(adbCallOf('ANDROID_SERIAL=emulator-5554 adb -P 5038 install app.apk')).toEqual({
+    bin: 'adb', sub: 'install', serial: 'emulator-5554', server: ['-P', '5038'],
+  })
+  expect(adbCallOf('adb -e logcat')).toEqual({ bin: 'adb', sub: 'logcat', only: 'emulator', server: [] })
+  expect(adbCallOf('adb devices && adb -t 45 logcat')).toEqual({ bin: 'adb', sub: 'logcat', transportId: '45', server: [] })
+  expect(adbCallOf('adb kill-server')).toBeUndefined()
+})
+
+test('adb devices -l parses, and serials say how a device is reached', async () => {
+  const listed = parseAdbDevices('* daemon not running; starting now at tcp:5037\n* daemon started successfully\n' + DEVICES)
+  expect(listed.map(d => `${d.serial}|${d.state}|${d.model ?? ''}|${d.board ?? ''}|${d.transportId ?? ''}`)).toEqual([
+    '192.168.0.110:36007|device|SM_S948B|m3q|45',
+    'R5CT1234ABC|unauthorized|||7',
+    'emulator-5554|offline|sdk_gphone64_arm64|emu64a|44',
+  ])
+  expect(parseAdbDevices('List of devices attached\nABC  no permissions (missing udev rules?); see [http://x] usb:1-2\n')[0]!.state).toBe(
+    'no permissions (missing udev rules?); see [http://x]',
+  )
+  expect(transportOf({ serial: '192.168.0.110:36007' })).toBe('wifi')
+  expect(transportOf({ serial: 'adb-R5CT1234ABC-x1Yz._adb-tls-connect._tcp' })).toBe('wifi')
+  expect(transportOf({ serial: 'localhost:5555' })).toBe('tcp')
+  expect(transportOf({ serial: 'emulator-5554' })).toBe('emulator')
+  expect(transportOf({ serial: 'R5CT1234ABC' })).toBe('usb')
+  expect(deviceNameOf("Nocturnal's S26 Ultra\n\n\n", 'SM_S948B')).toBe("Nocturnal's S26 Ultra")
+  expect(deviceNameOf('null\nMedium_Phone\n', 'sdk_gphone64_arm64')).toBe('Medium Phone')
+  expect(deviceNameOf('\n\n', 'Pixel_8_Pro')).toBe('Pixel 8 Pro')
+})
+
+test('a device is followed through drops, reconnects and a new port', async () => {
+  const call = adbCallOf('adb -s 192.168.0.110:36007 logcat')!
+  const phone = (serial: string, state: string) => `${serial}  ${state} product:m3qxxx model:SM_S948B device:m3q transport_id:45`
+  let d = nextDevice(undefined, parseAdbDevices(phone('192.168.0.110:36007', 'device')), call, 1000)
+  expect(d).toEqual({ serial: '192.168.0.110:36007', state: 'connected', since: 1000, drops: 0, adbState: 'device', transport: 'wifi', model: 'SM_S948B', board: 'm3q' })
+  d = { ...d, name: "Nocturnal's S26 Ultra" }
+  expect(deviceLabelOf(d)).toBe("Nocturnal's S26 Ultra · wifi")
+
+  d = nextDevice(d, parseAdbDevices(phone('192.168.0.110:36007', 'offline')), call, 5000)
+  expect([d.state, d.since, d.drops]).toEqual(['reconnecting', 5000, 1])
+  d = nextDevice(d, [], call, 9000)
+  expect([d.state, d.since, d.drops]).toEqual(['disconnected', 9000, 1])
+  // Wireless debugging came back on another port: the same phone, so the same name.
+  d = nextDevice(d, parseAdbDevices(phone('192.168.0.110:41233', 'device')), call, 12_000)
+  expect([d.state, d.serial, d.movedFrom, d.name, d.drops]).toEqual(['connected', '192.168.0.110:41233', '192.168.0.110:36007', "Nocturnal's S26 Ultra", 1])
+
+  // No device named and several listed: adb itself would refuse, so the band says why.
+  const any = adbCallOf('adb logcat')!
+  expect(nextDevice(undefined, parseAdbDevices(DEVICES), any, 0).error).toBe('3 devices, none named')
+  expect(nextDevice(undefined, parseAdbDevices(DEVICES), adbCallOf('adb -e logcat')!, 0).serial).toBe('emulator-5554')
+  expect(nextDevice(undefined, [], any, 0).state).toBe('searching')
+})
+
+test('an adb row names its phone and says whether it is there', async () => {
+  const at = 100_000
+  const base = { label: 'adb logcat', command: 'adb -s 192.168.0.110:36007 logcat', kind: 'adb' as const, isBackground: true, startedAt: at - 60_000 }
+  const device = { serial: '192.168.0.110:36007', name: "Nocturnal's S26 Ultra", transport: 'wifi' as const, model: 'SM_S948B', drops: 0 }
+  const rows = rowsOf(
+    [],
+    [
+      { ...base, id: 'a1', estimateMs: 10_000, devices: [{ ...device, state: 'connected', since: at - 60_000 }] },
+      { ...base, id: 'a2', devices: [{ ...device, state: 'reconnecting', adbState: 'offline', since: at - 4000, drops: 1 }] },
+      { ...base, id: 'a3', devices: [{ ...device, state: 'disconnected', since: at - 42_000, drops: 1 }] },
+      { ...base, id: 'a4', endedAt: at - 1000, isError: true, devices: [{ ...device, state: 'disconnected', since: at - 3000, drops: 1 }] },
+      {
+        ...base, id: 'a5',
+        devices: [
+          { ...device, state: 'connected', since: at - 60_000 },
+          { serial: '192.168.0.223:42549', name: "Nocturnal's S23 Ultra", transport: 'wifi' as const, state: 'disconnected', since: at - 5000, drops: 1 },
+        ],
+      },
+    ],
+    at,
+  )
+  expect(rows.map(r => r.detail)).toEqual([
+    ...Array(4).fill("Nocturnal's S26 Ultra · wifi"),
+    "Nocturnal's S26 Ultra + Nocturnal's S23 Ultra",
+  ])
+  // A device row has no estimate: it runs as long as it is wanted.
+  expect(rows.map(r => r.info.map(p => p.text).join(''))).toEqual([
+    '● connected · 1m 00s · background',
+    '◌ reconnecting 4s · 1m 00s · background',
+    '✗ disconnected 42s · 1m 00s · background',
+    '59s · ✗ disconnected 2s',
+    '● connected  ✗ disconnected 5s · 1m 00s · background',
+  ])
+  expect(rows[0]!.fraction).toBeUndefined()
+  expect(rows[0]!.stat.text).toBe('')
+  expect(rows.map(r => r.glyph.color)).toEqual(['claude', 'warning', 'error', 'error', 'error'])
+})
+
+test('the band follows the phone of a background adb command', async ($, on) => {
+  const clock = mock.clock(on, { now: 1000 })
+  mock.env(on, { HOME: '/Users/t' })
+  let listing = '192.168.0.110:36007    device product:m3qxxx model:SM_S948B device:m3q transport_id:45'
+  const ran: string[][] = []
+  on('process.run', ($, e) => {
+    ran.push([...e.argv])
+    if (e.argv[0] !== '/Users/t/Library/Android/sdk/platform-tools/adb') throw new Error('ENOENT')
+    if (e.argv.includes('devices')) return { value: { exitCode: 0, stdout: `List of devices attached\n${listing}\n`, stderr: '' } } as never
+    return { value: { exitCode: 0, stdout: "Nocturnal's S26 Ultra\n\n\n", stderr: '' } } as never
+  })
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'bgadb' } as never }))
+  await $.tool.call({ tool: 'Bash', command: '~/Library/Android/sdk/platform-tools/adb -s 192.168.0.110:36007 logcat', tool_use_id: 'adb1', run_in_background: true } as never)
+  await clock.settle()
+
+  let band = await bandText($)
+  expect(await band.find({ type: 'Text', text: /^adb logcat$/ })).toBeDefined()
+  expect(await band.find({ type: 'Text', text: /^Nocturnal's S26 Ultra/ })).toBeDefined()
+  expect(await band.find({ type: 'Text', text: /● connected/ })).toBeDefined()
+  await band.unmount()
+  expect(ran[0]).toEqual(['/Users/t/Library/Android/sdk/platform-tools/adb', 'devices', '-l'])
+
+  listing = '192.168.0.110:36007    offline product:m3qxxx model:SM_S948B device:m3q transport_id:45'
+  await clock.advance(3000)
+  band = await bandText($)
+  expect(await band.find({ type: 'Text', text: /◌ reconnecting/ })).toBeDefined()
+  await band.unmount()
+
+  listing = ''
+  await clock.advance(3000)
+  band = await bandText($)
+  expect(await band.find({ type: 'Text', text: /✗ disconnected/ })).toBeDefined()
+  await band.unmount()
+})
+
+test('adb lines that reach adb and the phone through variables and functions', async () => {
+  const sdk = '~/Library/Android/sdk/platform-tools/adb'
+  expect(expandLineVariables('A=~/sdk/adb; D="192.168.0.5:5555"; $A -s ${D} logcat')).toBe('A=~/sdk/adb; D="192.168.0.5:5555"; ~/sdk/adb -s 192.168.0.5:5555 logcat')
+  // Set twice to different values, or to something that runs: left as written.
+  expect(expandLineVariables('D=a; D=b; adb -s $D logcat')).toBe('D=a; D=b; adb -s $D logcat')
+  expect(expandLineVariables('T=$(gh auth token); echo $T')).toBe('T=$(gh auth token); echo $T')
+
+  const s26 = `A=${sdk}; D=192.168.0.110:36007; S=/tmp/x; \\\n$A -s $D shell am start -n x/.Main && $A -s $D logcat -d`
+  expect(labelOf(s26)).toBe('adb shell')
+  expect(kindOf(s26)).toBe('adb')
+  expect(adbCallsOf(s26).map(c => c.serial)).toEqual(['192.168.0.110:36007'])
+
+  const both = `A=${sdk}; ev() { $A -s 192.168.0.223:42549 shell "$@"; }; ev getprop; $A -s 192.168.0.110:36007 logcat`
+  expect(adbCallsOf(both).map(c => c.serial)).toEqual(['192.168.0.223:42549', '192.168.0.110:36007'])
+  expect(adbCallsOf(`adb() { ${sdk} -s 192.168.0.110:36007 "$@"; }; adb logcat`).map(c => c.serial)).toEqual(['192.168.0.110:36007'])
+  expect(adbCallsOf(`for D in a b; do ${sdk} -s $D logcat -d; done`).map(c => c.serial)).toEqual(['$D'])
+  expect(nextDevice(undefined, [], adbCallsOf(`for D in a b; do adb -s $D logcat; done`)[0]!, 0).error).toBe('device set by $D')
+  expect(adbCallsOf('adb devices -l; adb connect 192.168.0.110:36007')).toEqual([])
+})
+
+const PS = [
+  '  2763    19:31:18  46368 /Applications/Claude.app/Contents/MacOS/Claude --type=utility',
+  '48543    05:17:47 1598528 /Users/t/Library/Android/sdk/emulator/qemu/darwin-aarch64/qemu-system-aarch64 -avd Medium_Phone -memory 1536 -gpu host -port 5556 -no-snapshot-load',
+  // As CoreSimulator starts it today: no path, the device folder its only argument.
+  '51000 1-02:03:04  18576 launchd_sim /Users/t/Library/Developer/CoreSimulator/Devices/0C550FB1-9E0A-4F91-B9B7-28115AB382CD/data/var/run/launchd_bootstrap.plist',
+  '51001       00:31  24240 /Library/Developer/CoreSimulator/Volumes/iOS_23F77/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 26.5.simruntime/Contents/Resources/RuntimeRoot/usr/libexec/UserEventAgent (System)',
+  '',
+].join('\n')
+
+test('emulators and simulators are found in ps and simctl', async () => {
+  expect(etimeToMs('05:17:47')).toBe((5 * 3600 + 17 * 60 + 47) * 1000)
+  expect(etimeToMs('01:02')).toBe(62_000)
+  expect(etimeToMs('1-02:03:04')).toBe(((24 + 2) * 3600 + 3 * 60 + 4) * 1000)
+  const procs = parsePs(PS)
+  expect(procs.length).toBe(4)
+  expect(simulatorProcsOf(parsePs('77 00:10 1 /Applications/Xcode.app/x/sbin/launchd_sim /Users/t/Devices/X/data\n')).length).toBe(1)
+  expect(androidEmulatorsOf(procs)).toEqual([
+    { pid: 48543, avd: 'Medium_Phone', serial: 'emulator-5556', upMs: etimeToMs('05:17:47'), rssKb: 1598528, adb: '/Users/t/Library/Android/sdk/platform-tools/adb' },
+  ])
+  expect(simulatorProcsOf(procs).map(p => p.pid)).toEqual([51000])
+  expect(runtimeName('com.apple.CoreSimulator.SimRuntime.iOS-18-2')).toBe('iOS 18.2')
+  expect(runtimeName('com.apple.CoreSimulator.SimRuntime.iOS-27-2-iPhone19-4')).toBe('iOS 27.2')
+  expect(runtimeName('com.apple.CoreSimulator.SimRuntime.xrOS-2-0')).toBe('visionOS 2.0')
+  const sims = parseSimctl(JSON.stringify({ devices: {
+    'com.apple.CoreSimulator.SimRuntime.iOS-18-2': [
+      { udid: '0C550FB1-9E0A-4F91-B9B7-28115AB382CD', name: 'iPhone 16 Pro', state: 'Booted', isAvailable: true },
+      { udid: 'AAAA', name: 'iPad Air', state: 'Shutdown', isAvailable: true },
+    ],
+    'com.apple.CoreSimulator.SimRuntime.watchOS-11-2': [{ udid: 'BBBB', name: 'Apple Watch Series 10', state: 'Booting' }],
+  } }))
+  expect(sims).toEqual([
+    { udid: '0C550FB1-9E0A-4F91-B9B7-28115AB382CD', name: 'iPhone 16 Pro', state: 'Booted', os: 'iOS 18.2' },
+    { udid: 'BBBB', name: 'Apple Watch Series 10', state: 'Booting', os: 'watchOS 11.2' },
+  ])
+  expect(androidBootOf('1\n17\n37\n')).toEqual({ isBooted: true, os: 'Android 17 · API 37' })
+  expect(androidBootOf('\n\n\n')).toEqual({ isBooted: false })
+  expect(memory(1598528)).toBe('1.5 GB')
+  expect(memory(90000)).toBe('88 MB')
+})
+
+test('emulator rows show what runs, its OS, uptime and memory, then end', async () => {
+  const at = 1_000_000
+  const emu = { id: 'android:1', platform: 'android' as const, name: 'Medium Phone', serial: 'emulator-5554', state: 'booted' as const, os: 'Android 17 · API 37', startedAt: at - 3_780_000, rssKb: 1598528 }
+  const sim = { id: 'ios:X', platform: 'ios' as const, name: 'iPhone 16 Pro', serial: 'X', state: 'booting' as const, os: 'iOS 18.2', startedAt: at - 12_000 }
+  const text = (r: ReturnType<typeof emulatorRow>) => r.info.map(p => p.text).join('')
+  const a = emulatorRow(emu, at)
+  expect([a.name, a.detail, a.stat.text, a.hasNoMeter, a.glyph.text]).toEqual(['emulator', 'Medium Phone', 'on', true, '●'])
+  expect(text(a)).toBe('Android 17 · API 37 · emulator-5554 · up 1h 03m · 1.5 GB')
+  const b = emulatorRow(sim, at)
+  expect([b.name, b.detail, b.stat.text, b.hasNoMeter, b.glyph.color]).toEqual(['simulator', 'iPhone 16 Pro', '…', false, 'warning'])
+  expect(text(b)).toBe('booting 12s · iOS 18.2 · up 12s')
+
+  // ps rounds to the second: a start that moves a little stays put; one gone ends now.
+  const merged = mergeEmulators([emu, sim], [{ ...emu, startedAt: emu.startedAt + 900, os: undefined }], at)
+  expect(merged.map(e => [e.id, e.startedAt, e.os, e.endedAt])).toEqual([
+    ['android:1', emu.startedAt, 'Android 17 · API 37', undefined],
+    ['ios:X', sim.startedAt, 'iOS 18.2', at],
+  ])
+  expect(text(emulatorRow(merged[1]!, at + 2000))).toBe('stopped after 12s')
+})
+
+test('a session shows the emulators and simulators running on the machine', async ($, on) => {
+  const clock = mock.clock(on, { now: 1000 })
+  mock.env(on, { HOME: '/Users/t', TMPDIR: '/tmp/' })
+  mock.store(on)
+  let ps = PS
+  const asked: string[] = []
+  on('process.run', ($, e) => {
+    const argv = [...e.argv]
+    asked.push(argv.slice(0, 2).join(' '))
+    if (argv[0] === 'ps') return { value: { exitCode: 0, stdout: ps, stderr: '' } } as never
+    if (argv[0] === 'xcrun') {
+      const devices = { 'com.apple.CoreSimulator.SimRuntime.iOS-18-2': [{ udid: '0C550FB1-9E0A-4F91-B9B7-28115AB382CD', name: 'iPhone 16 Pro', state: 'Booted' }] }
+      return { value: { exitCode: 0, stdout: JSON.stringify({ devices }), stderr: '' } } as never
+    }
+    if (argv[0] === '/Users/t/Library/Android/sdk/platform-tools/adb') return { value: { exitCode: 0, stdout: '1\n17\n37\n', stderr: '' } } as never
+    throw new Error('ENOENT')
+  })
+  on('command.register', () => ({ value: undefined }) as never)
+  on('session.start', ($, e) => e as never)
+  await $.session.start({ cwd: '/work', source: 'startup' } as never)
+  await clock.settle()
+
+  let band = await bandText($)
+  expect(await band.find({ type: 'Text', text: /^emulator$/ })).toBeDefined()
+  expect(await band.find({ type: 'Text', text: /^Medium Phone$/ })).toBeDefined()
+  expect(await band.find({ type: 'Text', text: /Android 17 · API 37 · emulator-5556 · up 5h 17m · 1\.5 GB/ })).toBeDefined()
+  expect(await band.find({ type: 'Text', text: /^simulator$/ })).toBeDefined()
+  expect(await band.find({ type: 'Text', text: /iOS 18\.2 · up 1h 03m|iOS 18\.2 · up 26h/ })).toBeDefined()
+  await band.unmount()
+
+  // Booted once: the next look runs ps alone.
+  asked.length = 0
+  await clock.advance(5000)
+  expect(asked).toEqual(['ps -axo'])
+
+  ps = ''
+  await clock.advance(5000)
+  band = await bandText($)
+  expect(await band.find({ type: 'Text', text: /stopped after/ })).toBeDefined()
+  await band.unmount()
+})
+
+test('every phone adb lists has a row, followed through drops and new ports', async () => {
+  const s26 = (serial: string, state = 'device') => `${serial}  ${state} product:m3qxxx model:SM_S948B device:m3q transport_id:45`
+  const s23 = '192.168.0.223:42549  device product:dm3qxxx model:SM_S918B device:dm3q transport_id:13'
+  const emu = 'emulator-5554  device product:sdk_gphone64_arm64 model:sdk_gphone64_arm64 device:emu64a transport_id:44'
+  let list = nextPhones([], parseAdbDevices([s26('192.168.0.110:36007'), s23, emu].join('\n')), 0)
+  expect(list.map(p => `${p.id}|${p.state}`)).toEqual(['192.168.0.110:36007|connected', '192.168.0.223:42549|connected'])
+
+  list = nextPhones(list, parseAdbDevices([s26('192.168.0.110:36007', 'offline'), s23].join('\n')), 3000)
+  expect(list.map(p => p.state)).toEqual(['reconnecting', 'connected'])
+  list = nextPhones(list, parseAdbDevices(s23), 6000)
+  expect(list.map(p => p.state)).toEqual(['disconnected', 'connected'])
+  // Back on a new port: the same row, not a second S26.
+  list = nextPhones(list, parseAdbDevices([s23, s26('192.168.0.110:41001')].join('\n')), 9000)
+  expect(list.map(p => `${p.id}|${p.serial}|${p.state}|${p.drops}`)).toEqual([
+    '192.168.0.110:36007|192.168.0.110:41001|connected|1',
+    '192.168.0.223:42549|192.168.0.223:42549|connected|0',
+  ])
+
+  expect(deviceInfoOf("Nocturnal's S26 Ultra\n\n\n17\n37\n", 'SM_S948B')).toEqual({ name: "Nocturnal's S26 Ultra", os: 'Android 17 · API 37' })
+  const row = phoneRow({ ...list[0]!, name: "Nocturnal's S26 Ultra", os: 'Android 17 · API 37' }, 9000)
+  expect([row.name, row.detail, row.stat.text, row.glyph.text]).toEqual(['phone', "Nocturnal's S26 Ultra", 'on', '●'])
+  expect(row.info.map(p => p.text).join('')).toBe('● connected · reconnected 1× · Android 17 · API 37 · 192.168.0.110:41001')
+  const gone = phoneRow({ ...list[1]!, state: 'disconnected', since: 0 }, 75_000)
+  expect([gone.stat.text, gone.glyph.color, gone.info[0]!.text]).toEqual(['off', 'error', '✗ disconnected 1m 15s'])
+})
+
+test('a session shows the phones adb lists while its server runs', async ($, on) => {
+  const clock = mock.clock(on, { now: 1000 })
+  mock.env(on, { HOME: '/Users/t' })
+  mock.store(on)
+  const adb = '/Users/t/Library/Android/sdk/platform-tools/adb'
+  on('process.run', ($, e) => {
+    const argv = [...e.argv]
+    if (argv[0] === 'ps') return { value: { exitCode: 0, stdout: ' 8545 01-21:15:01  9000 adb -L tcp:5037 fork-server server --reply-fd 4\n', stderr: '' } } as never
+    if (argv[0] !== adb) throw new Error('ENOENT')
+    if (argv[1] === 'devices') {
+      const out = 'List of devices attached\n192.168.0.110:36007 device product:m3qxxx model:SM_S948B device:m3q transport_id:45\n192.168.0.223:42549 device product:dm3qxxx model:SM_S918B device:dm3q transport_id:13\n'
+      return { value: { exitCode: 0, stdout: out, stderr: '' } } as never
+    }
+    const name = argv[2] === '192.168.0.110:36007' ? "Nocturnal's S26 Ultra" : "Nocturnal's S23 Ultra"
+    return { value: { exitCode: 0, stdout: `${name}\n\n\n17\n37\n`, stderr: '' } } as never
+  })
+  on('command.register', () => ({ value: undefined }) as never)
+  on('session.start', ($, e) => e as never)
+  await $.session.start({ cwd: '/work', source: 'startup' } as never)
+  await clock.settle()
+  const band = await bandText($)
+  expect(await band.find({ type: 'Text', text: /^Nocturnal's S26 Ultra$/ })).toBeDefined()
+  expect(await band.find({ type: 'Text', text: /^Nocturnal's S23 Ultra$/ })).toBeDefined()
+  expect(await band.find({ type: 'Text', text: /● connected · Android 17 · API 37 · 192\.168\.0\.110:36007/ })).toBeDefined()
   await band.unmount()
 })
